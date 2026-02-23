@@ -33,7 +33,7 @@ Both Qwen2-VL-7B and InternVL2-8B fit comfortably in 24GB VRAM at bf16.
 # 3. AMI: Deep Learning AMI GPU PyTorch 2.x (Ubuntu 22.04)
 #    - Search "Deep Learning AMI" in AMI catalog
 #    - This comes with CUDA, PyTorch, conda pre-installed
-# 4. Instance type: g5.4xlarge
+# 4. Instance type: g5.xlarge
 # 5. Key pair: create or use existing .pem file
 # 6. Storage: 200GB gp3
 # 7. Security Group: allow SSH (port 22) from your IP
@@ -52,7 +52,7 @@ ssh -i your-key.pem -L 8888:localhost:8888 ubuntu@<your-ec2-public-ip>
 
 ```bash
 # Activate the pre-installed PyTorch conda env
-conda activate pytorch
+source /opt/pytorch/bin/activate
 
 # Install required packages
 pip install transformers==4.45.0 \
@@ -68,6 +68,8 @@ pip install transformers==4.45.0 \
             matplotlib \
             scikit-learn \
             tqdm
+
+pip install -U transformers
 
 # For InternVL2 specifically
 pip install torchvision \
@@ -86,11 +88,10 @@ export HF_HOME=/home/ubuntu/hf_cache
 mkdir -p $HF_HOME
 
 # Download models (will cache to HF_HOME)
-python -c "
-from transformers import AutoProcessor, AutoModelForCausalLM
-# Qwen2-VL
+python3 -c "
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 AutoProcessor.from_pretrained('Qwen/Qwen2-VL-7B-Instruct')
-AutoModelForCausalLM.from_pretrained('Qwen/Qwen2-VL-7B-Instruct')
+Qwen2VLForConditionalGeneration.from_pretrained('Qwen/Qwen2-VL-7B-Instruct')
 print('Qwen2-VL downloaded')
 "
 
