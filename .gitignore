@@ -1,1 +1,3 @@
+*.pem
+.env
 /inference/__pycache__/
