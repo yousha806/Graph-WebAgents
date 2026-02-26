@@ -1,0 +1,17 @@
+# Core
+datasets>=2.19.0
+torch>=2.1.0
+transformers>=4.44.0
+accelerate>=0.33.0
+
+# Image handling
+Pillow>=10.0.0
+
+# AXTree precomputation (headless browser)
+playwright>=1.40.0
+
+# Quantised inference (optional – only needed for 4-bit baselines)
+bitsandbytes>=0.43.0
+
+# Misc
+tqdm>=4.66.0
