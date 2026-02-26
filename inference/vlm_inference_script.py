@@ -29,6 +29,13 @@ import argparse
 import json
 from collections import defaultdict, Counter
 from typing import List, Dict
+import os
+import random
+import time
+try:
+    from baselines.models.multimodal_internvl2 import run as internvl2_run
+except Exception:
+    internvl2_run = None
 
 FINAL_CHECKLIST = [
     "Element Accuracy (Top-1 grounding)",
@@ -183,12 +190,97 @@ def compute_metrics_from_file(path: str, topk: int = 3) -> Dict:
         metrics["task_success_rate"] = tsr
     return metrics
 
+
+# --- Baseline runner / value-state collection utilities ---
+def load_jsonl(path: str) -> List[Dict]:
+    out = []
+    with open(path, "r", encoding="utf8") as f:
+        for line in f:
+            j = safe_load_line(line)
+            if j is not None:
+                out.append(j)
+    return out
+
+def save_jsonl(path: str, records: List[Dict]):
+    with open(path, "w", encoding="utf8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+def simulate_model_response(example: Dict, model_name: str, state_dim: int = 16) -> Dict:
+    """Simulate a model response and return predicted fields and a numeric 'value_states' vector.
+
+    This is used as a fallback for baseline testing when the actual model bindings
+    are not available. Replace the body of this function with real inference calls.
+    """
+    # deterministic pseudo-randomness for reproducibility across runs
+    seed = hash(str(example.get("id", example.get("image", example.get("instruction", time.time()))))) & 0xFFFFFFFF
+    rnd = random.Random(seed)
+    # Simulated prediction pieces
+    pred_value = example.get("gt_value") or f"SIM_VAL_{example.get('id', rnd.randint(0,999999))}"
+    pred_action = rnd.choice(["CLICK", "TYPE", "SCROLL"]) if rnd.random() < 0.9 else "NOOP"
+    pred_element = None
+    cands = example.get("candidates") or []
+    if cands:
+        pred_element = cands[0]
+
+    # Simulated numeric state vector (value_states)
+    value_states = [rnd.random() for _ in range(state_dim)]
+
+    return {
+        "pred_value": pred_value,
+        "pred_action": pred_action,
+        "pred_element": pred_element,
+        "value_states": value_states,
+    }
+
+def run_baseline_on_dataset(dataset_path: str, model_name: str, out_preds_path: str, simulate: bool = True, state_dim: int = 16):
+    """Run baseline inference across a JSONL dataset and save predictions JSONL including value_states.
+
+    Currently supports a `simulate` mode. To integrate a real model, implement a
+    wrapper that calls the model client and returns the same keys produced by
+    `simulate_model_response`.
+    """
+    examples = load_jsonl(dataset_path)
+    preds = []
+    for ex in examples:
+        if simulate:
+            out = simulate_model_response(ex, model_name, state_dim=state_dim)
+        else:
+            # Placeholder: user should implement actual model inference here.
+            raise RuntimeError("Non-simulated model inference not implemented. Replace with real model calls.")
+
+        # Build a prediction record compatible with the evaluator
+        rec = {
+            "id": ex.get("id"),
+            "gt_element": ex.get("gt_element"),
+            "gt_action": ex.get("gt_action"),
+            "gt_value": ex.get("gt_value"),
+            "pred_element": out.get("pred_element"),
+            "pred_action": out.get("pred_action"),
+            "pred_value": out.get("pred_value"),
+            "value_states": out.get("value_states"),
+            "candidates": ex.get("candidates") or [],
+        }
+        preds.append(rec)
+
+    os.makedirs(os.path.dirname(out_preds_path) or ".", exist_ok=True)
+    save_jsonl(out_preds_path, preds)
+    print(f"Wrote simulated predictions (model={model_name}) to {out_preds_path}")
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--write-checklist", help="Path to write checklist markdown")
     p.add_argument("--eval", help="Path to predictions JSONL file")
     p.add_argument("--out", help="Output JSON path for metrics")
     p.add_argument("--topk", type=int, default=3)
+    # Baseline / inference options
+    p.add_argument("--run-baselines", action="store_true", help="Run baseline inference on a dataset and save preds JSONL")
+    p.add_argument("--model", choices=["intern_vl2_8b", "image_only"], default="intern_vl2_8b", help="Which baseline model to run")
+    p.add_argument("--dataset", help="Path to input dataset JSONL for running baselines")
+    p.add_argument("--dataset-split", help="Hugging Face dataset split name (e.g. test_website) when running HF runner")
+    p.add_argument("--preds-out", help="Path to write baseline predictions JSONL (includes value_states)")
+    p.add_argument("--simulate-baselines", action="store_true", help="Use simulated model outputs instead of real model calls")
+    p.add_argument("--state-dim", type=int, default=16, help="Dimensionality of simulated value_states vectors")
     args = p.parse_args()
     if args.write_checklist:
         write_checklist(args.write_checklist)
@@ -200,5 +292,28 @@ def main():
             print(f"Wrote metrics to {args.out}")
         else:
             print(json.dumps(metrics, indent=2))
+    if args.run_baselines:
+        if not args.dataset or not args.preds_out:
+            print("--run-baselines requires --dataset and --preds-out")
+            return
+        # If simulate flag is set, use the lightweight simulator
+        if args.simulate_baselines:
+            run_baseline_on_dataset(args.dataset, args.model, args.preds_out, simulate=True, state_dim=args.state_dim)
+            return
+
+        # Non-simulated: route to model-specific runner when available
+        if args.model == "intern_vl2_8b":
+            if internvl2_run is None:
+                print("Intern VL2 runner not available (can't import baselines.models.multimodal_internvl2).")
+                print("Ensure baselines/models/multimodal_internvl2.py is present and importable.")
+                return
+            # args.dataset may be a HF split name; fall back to 'test_website' if not provided
+            dataset_split = args.dataset_split or args.dataset or "test_website"
+            # Call the intern vl2 runner which will write preds to --preds-out
+            internvl2_run(dataset_split=dataset_split, preds_out=args.preds_out, extract_states=True)
+            return
+
+        # Fallback: if no specialized runner, try file-based runner
+        run_baseline_on_dataset(args.dataset, args.model, args.preds_out, simulate=False, state_dim=args.state_dim)
 if __name__ == "__main__":
     main()
