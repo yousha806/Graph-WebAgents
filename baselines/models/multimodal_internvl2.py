@@ -7,6 +7,7 @@ from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig
 from datasets import load_dataset
 import os
 from dotenv import load_dotenv
+from huggingface_hub import InferenceApi
 
 
 load_dotenv()
@@ -36,28 +37,50 @@ def save_jsonl(path, records):
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
 
-def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True):
-    print(f"Loading model {MODEL_NAME}...")
-    if bnb_available:
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            quantization_config=bnb_config,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-            trust_remote_code=True,
-            token=HF_TOKEN,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            trust_remote_code=True,
-            token=HF_TOKEN,
-        )
+def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True, use_endpoint: bool = False, endpoint_repo: str = None):
+    print(f"Initializing runner for {MODEL_NAME}...")
 
-    processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True, token=HF_TOKEN)
+    inference_client = None
+    model = None
+    processor = None
+
+    if use_endpoint:
+        if not endpoint_repo:
+            raise ValueError("--use-endpoint requires --endpoint-repo to be provided")
+        print(f"Using Hugging Face Inference API for {endpoint_repo}")
+        inference_client = InferenceApi(repo_id=endpoint_repo, token=HF_TOKEN)
+    else:
+        print(f"Loading model {MODEL_NAME} locally...")
+        try:
+            if bnb_available:
+                model = AutoModelForCausalLM.from_pretrained(
+                    MODEL_NAME,
+                    quantization_config=bnb_config,
+                    device_map="auto",
+                    low_cpu_mem_usage=True,
+                    trust_remote_code=True,
+                    token=HF_TOKEN,
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    MODEL_NAME,
+                    device_map="auto",
+                    low_cpu_mem_usage=True,
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    trust_remote_code=True,
+                    token=HF_TOKEN,
+                )
+
+            processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True, token=HF_TOKEN)
+        except Exception as e:
+            print("Local model load failed:", e)
+            if endpoint_repo:
+                print("Falling back to Hugging Face Inference API using endpoint_repo")
+                inference_client = InferenceApi(repo_id=endpoint_repo, token=HF_TOKEN)
+                model = None
+                processor = None
+            else:
+                raise
 
     # Load dataset
     print("Loading dataset from Hugging Face...")
@@ -89,29 +112,59 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             }
         ]
 
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(
-            text=[text],
-            images=[row.get("screenshot")],
-            padding=True,
-            return_tensors="pt",
-            process_condition_type="test",
-            min_pixels=256 * 28 * 28,
-            max_pixels=MAX_PIXELS,
-        ).to(device)
+        # Prepare prompt text
+        if processor:
+            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        else:
+            # minimal text fallback
+            text = f"Task: {task}\nActions:\n{candidate_text}\nSelect the correct action index. Answer with ONLY the number."
 
-        with torch.inference_mode():
-            # generation for predicting index
-            output_ids = model.generate(**inputs, max_new_tokens=10)
+        if inference_client is not None:
+            # Call the inference endpoint. Try to include image when available.
+            try:
+                img_in = row.get("screenshot")
+                if img_in:
+                    if isinstance(img_in, str) and img_in.startswith("http"):
+                        payload = {"text": text, "image": img_in}
+                        resp = inference_client(payload)
+                    else:
+                        img_obj = Image.open(img_in).convert("RGB")
+                        resp = inference_client({"text": text}, image=img_obj)
+                else:
+                    resp = inference_client({"text": text})
 
-        # decode generated output
-        try:
-            generated_ids = [
-                output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)
-            ]
-            pred_text = processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
-        except Exception:
-            pred_text = "".join([str(x.item()) for x in output_ids.view(-1)])
+                # Normalize response to text
+                if isinstance(resp, dict):
+                    pred_text = resp.get("generated_text") or json.dumps(resp)
+                elif isinstance(resp, list):
+                    pred_text = resp[0] if resp else ""
+                else:
+                    pred_text = str(resp)
+            except Exception as e:
+                print("Endpoint call failed:", e)
+                raise
+        else:
+            inputs = processor(
+                text=[text],
+                images=[row.get("screenshot")],
+                padding=True,
+                return_tensors="pt",
+                process_condition_type="test",
+                min_pixels=256 * 28 * 28,
+                max_pixels=MAX_PIXELS,
+            ).to(device)
+
+            with torch.inference_mode():
+                output_ids = model.generate(**inputs, max_new_tokens=10)
+
+            # decode generated output
+            try:
+                generated_ids = [
+                    output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs.input_ids, output_ids)
+                ]
+                pred_text = processor.batch_decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+            except Exception:
+                pred_text = "".join([str(x.item()) for x in output_ids.view(-1)])
 
         # parse predicted index
         pred_idx = None
@@ -122,35 +175,35 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             pred_idx = None
 
         # map to pred_element and pred_action heuristically
-            pred_element = candidates[pred_idx] if (pred_idx is not None and 0 <= pred_idx < len(candidates)) else None
+        pred_element = candidates[pred_idx] if (pred_idx is not None and 0 <= pred_idx < len(candidates)) else None
 
-            # try to infer action from the candidate string (common formats include "CLICK ...", "TYPE ...")
-            def extract_action_from_text(s: str):
-                if not s or not isinstance(s, str):
-                    return None
-                for a in ["CLICK", "TYPE", "SCROLL", "NOOP", "HOVER", "SELECT", "SUBMIT"]:
-                    if a in s.upper().split():
-                        return a
-                # fallback: look for verbs at start
-                toks = s.strip().split()
-                if toks:
-                    t0 = toks[0].upper().strip(':,')
-                    if len(t0) <= 10 and t0.isalpha():
-                        return t0
+        # try to infer action from the candidate string (common formats include "CLICK ...", "TYPE ...")
+        def extract_action_from_text(s: str):
+            if not s or not isinstance(s, str):
                 return None
+            for a in ["CLICK", "TYPE", "SCROLL", "NOOP", "HOVER", "SELECT", "SUBMIT"]:
+                if a in s.upper().split():
+                    return a
+            # fallback: look for verbs at start
+            toks = s.strip().split()
+            if toks:
+                t0 = toks[0].upper().strip(':,')
+                if len(t0) <= 10 and t0.isalpha():
+                    return t0
+            return None
 
-            pred_action = None
-            if pred_element is not None:
-                # if candidate carries action info, extract it
-                cand_text = candidates[pred_idx]
-                pred_action = extract_action_from_text(cand_text)
-            # fallback strategies
-            if pred_action is None:
-                # if the prediction matches the target, use target_action if present
-                if pred_idx is not None and target is not None and pred_idx == target:
-                    pred_action = row.get("target_action") or row.get("gt_action") or "CLICK"
-                else:
-                    pred_action = "CLICK"
+        pred_action = None
+        if pred_element is not None:
+            # if candidate carries action info, extract it
+            cand_text = candidates[pred_idx]
+            pred_action = extract_action_from_text(cand_text)
+        # fallback strategies
+        if pred_action is None:
+            # if the prediction matches the target, use target_action if present
+            if pred_idx is not None and target is not None and pred_idx == target:
+                pred_action = row.get("target_action") or row.get("gt_action") or "CLICK"
+            else:
+                pred_action = "CLICK"
 
         # extract value_states by forwarding model with hidden states if requested
         value_states = None
@@ -205,5 +258,7 @@ if __name__ == "__main__":
     p.add_argument("--split", default="test_website", help="HF dataset split name")
     p.add_argument("--preds-out", required=True, help="Path to write predictions JSONL")
     p.add_argument("--no-states", dest="extract_states", action="store_false", help="Disable extraction of hidden-state value vectors")
+    p.add_argument("--use-endpoint", action="store_true", help="Use Hugging Face Inference API endpoint instead of loading model locally")
+    p.add_argument("--endpoint-repo", default=None, help="Hugging Face repo id or endpoint to call when using --use-endpoint (e.g. OpenGVLab/InternVL2-8B)")
     args = p.parse_args()
-    run(dataset_split=args.split, preds_out=args.preds_out, extract_states=args.extract_states)
+    run(dataset_split=args.split, preds_out=args.preds_out, extract_states=args.extract_states, use_endpoint=args.use_endpoint, endpoint_repo=args.endpoint_repo)
