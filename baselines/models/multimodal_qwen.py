@@ -31,7 +31,7 @@ total = 0
 results = []
 for row in tqdm(dataset):
     task = row["confirmed_task"]
-    html = row["cleaned_html"][:15000]
+    html = row["cleaned_html"][:8000]
     candidates = row["action_reprs"]
     target = int(row["target_action_index"])
     
