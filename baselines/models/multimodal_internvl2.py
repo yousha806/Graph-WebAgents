@@ -45,7 +45,7 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             device_map="auto",
             low_cpu_mem_usage=True,
             trust_remote_code=True,
-            use_auth_token=HF_TOKEN,
+            token=HF_TOKEN,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
@@ -54,10 +54,10 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             low_cpu_mem_usage=True,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             trust_remote_code=True,
-            use_auth_token=HF_TOKEN,
+            token=HF_TOKEN,
         )
 
-    processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True, use_auth_token=HF_TOKEN)
+    processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True, token=HF_TOKEN)
 
     # Load dataset
     print("Loading dataset from Hugging Face...")
