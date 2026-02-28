@@ -17,19 +17,34 @@ if "playwright" not in sys.modules:
 import precompute_axtree
 
 
-class _FakeAccessibility:
-    def __init__(self, snapshot_value):
-        self.snapshot_value = snapshot_value
+class _FakeCdpSession:
+    def __init__(self, nodes):
+        self._nodes = nodes
+        self.detached = False
 
-    def snapshot(self, interesting_only=False):
-        return self.snapshot_value
+    def send(self, method, params):
+        if method == "Accessibility.getFullAXTree":
+            return {"nodes": self._nodes}
+        raise ValueError(f"Unknown CDP method: {method}")
+
+    def detach(self):
+        self.detached = True
+
+
+class _FakeContext:
+    def __init__(self, cdp_session):
+        self._cdp_session = cdp_session
+
+    def new_cdp_session(self, page):
+        return self._cdp_session
 
 
 class _FakePage:
-    def __init__(self, snapshot_value):
+    def __init__(self, nodes):
         self.last_html = None
         self.last_wait_until = None
-        self.accessibility = _FakeAccessibility(snapshot_value)
+        _session = _FakeCdpSession(nodes)
+        self.context = _FakeContext(_session)
 
     def set_content(self, html, wait_until):
         self.last_html = html
@@ -59,13 +74,56 @@ class PrecomputeAXTreeTests(unittest.TestCase):
         self.assertIn("textbox: Query value=abc", text)
 
     def test_html_to_axtree_sanitizes_before_snapshot(self):
-        page = _FakePage(snapshot_value={"role": "WebArea"})
+        nodes = [
+            {
+                "nodeId": "1",
+                "role": {"value": "WebArea"},
+                "name": {"value": "Root"},
+                "childIds": [],
+            }
+        ]
+        page = _FakePage(nodes)
         out = precompute_axtree.html_to_axtree(page, "<script>x</script><div>hi</div>")
 
-        self.assertEqual(out, {"role": "WebArea"})
-        self.assertEqual(page.last_wait_until, "domcontentloaded")
+        self.assertEqual(out, {"role": "WebArea", "name": "Root"})
+        # Must use 'load' (not 'domcontentloaded') so inline scripts finish
+        # updating ARIA attributes before we snapshot the AX tree.
+        self.assertEqual(page.last_wait_until, "load")
         self.assertNotIn("<script", page.last_html.lower())
         self.assertIn("<div>hi</div>", page.last_html)
+
+    def test_cdp_nodes_to_tree_filters_ignored_nodes(self):
+        """Chrome marks non-semantic nodes ignored=True; they must be dropped."""
+        nodes = [
+            {
+                "nodeId": "1",
+                "role": {"value": "WebArea"},
+                "name": {"value": "Root"},
+                "ignored": False,
+                "childIds": ["2", "3"],
+            },
+            {
+                "nodeId": "2",
+                "role": {"value": ""},
+                "name": {"value": ""},
+                "ignored": True,  # Should be dropped
+                "childIds": [],
+            },
+            {
+                "nodeId": "3",
+                "role": {"value": "button"},
+                "name": {"value": "Submit"},
+                "ignored": False,
+                "childIds": [],
+            },
+        ]
+        result = precompute_axtree._cdp_nodes_to_tree(nodes)
+        self.assertEqual(result["role"], "WebArea")
+        # The ignored node (nodeId 2) must not appear; only the button survives.
+        children = result.get("children", [])
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0]["role"], "button")
+        self.assertEqual(children[0]["name"], "Submit")
 
 
 if __name__ == "__main__":
