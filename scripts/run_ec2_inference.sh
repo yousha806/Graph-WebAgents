@@ -113,13 +113,15 @@ source "$CONDA_BASE/etc/profile.d/conda.sh"
 if [[ -n "$CONDA_ENV_PREFIX" ]]; then
   if [[ ! -d "$CONDA_ENV_PREFIX" ]]; then
     echo "Creating conda env at prefix: $CONDA_ENV_PREFIX (python=$PYTHON_VERSION)"
-    conda create -y -p "$CONDA_ENV_PREFIX" "python=$PYTHON_VERSION"
+    conda create -y -p "$CONDA_ENV_PREFIX" "python=$PYTHON_VERSION" \
+      --override-channels -c conda-forge
   fi
   conda activate "$CONDA_ENV_PREFIX"
 elif [[ -n "$CONDA_ENV_NAME" ]]; then
   if ! conda env list | awk '{print $1}' | grep -Fxq "$CONDA_ENV_NAME"; then
     echo "Creating conda env: $CONDA_ENV_NAME (python=$PYTHON_VERSION)"
-    conda create -y -n "$CONDA_ENV_NAME" "python=$PYTHON_VERSION"
+    conda create -y -n "$CONDA_ENV_NAME" "python=$PYTHON_VERSION" \
+      --override-channels -c conda-forge
   fi
   conda activate "$CONDA_ENV_NAME"
 else
@@ -170,6 +172,8 @@ if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
 fi
 
 # Needed for precompute_axtree.py
+# install-deps installs required OS-level shared libraries (libatk, libglib, etc.)
+playwright install-deps chromium
 playwright install chromium
 
 # Export env vars so subprocesses (heredocs, parallel workers) can read them
@@ -210,15 +214,16 @@ sync_to_s3() {
 }
 
 # ---------- Download ONLY test splits ----------
+# HF_DATASETS_CACHE is already exported above; no --cache_dir needed.
 python download_mind2web.py \
   --splits "${SPLITS[@]}" \
-  --output_dir "$DATA_DIR" \
-  --cache_dir "$HF_CACHE_DIR"
+  --output_dir "$DATA_DIR"
 
 # ---------- Precompute AXTree for test splits ----------
 for split in "${SPLITS[@]}"; do
   python precompute_axtree.py \
     --split "$split" \
+    --data_dir "$DATA_DIR" \
     --out_dir "$AXTREE_DIR"
 done
 

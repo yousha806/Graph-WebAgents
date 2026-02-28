@@ -2,7 +2,7 @@ import argparse
 from typing import Dict, Optional
 
 import torch
-from datasets import load_dataset
+from datasets import load_from_disk
 from tqdm import tqdm
 
 MODEL_NAME = "Qwen/Qwen2-VL-7B-Instruct"
@@ -13,6 +13,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Qwen2-VL baseline on Mind2Web")
     parser.add_argument("--model_name", default=MODEL_NAME)
     parser.add_argument("--split", default="test_website")
+    parser.add_argument("--data_dir", default="data/mind2web",
+                        help="Directory produced by download_mind2web.py")
     parser.add_argument("--max_html_chars", type=int, default=15000)
     parser.add_argument(
         "--quantization",
@@ -60,8 +62,9 @@ def main() -> None:
     args = parse_args()
     model, processor = load_qwen_model(args.model_name, args.quantization)
 
-    print(f"Loading dataset split '{args.split}' from Hugging Face...")
-    dataset = load_dataset("osunlp/Multimodal-Mind2Web", split=args.split)
+    split_path = f"{args.data_dir}/{args.split}"
+    print(f"Loading dataset split '{args.split}' from disk: {split_path}")
+    dataset = load_from_disk(split_path)
 
     correct = 0
     total = 0

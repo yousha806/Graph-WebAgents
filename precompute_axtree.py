@@ -12,12 +12,12 @@ Example:
 import argparse
 import json
 import re
+from pathlib import Path
 
-from datasets import load_dataset
+from datasets import load_from_disk
 from playwright.sync_api import sync_playwright
 from tqdm import tqdm
 
-DATASET_NAME = "osunlp/Multimodal-Mind2Web"
 VALID_SPLITS = ["train", "test_task", "test_website", "test_domain"]
 
 # -----------------------------
@@ -81,12 +81,20 @@ def html_to_axtree(page, html: str) -> dict:
 def main():
     ap = argparse.ArgumentParser(description="Precompute AXTree for Mind2Web splits")
     ap.add_argument("--split", default="train", choices=VALID_SPLITS)
+    ap.add_argument("--data_dir", default="data/mind2web",
+                    help="Directory produced by download_mind2web.py (contains one sub-dir per split)")
     ap.add_argument("--out_dir", default="data/mind2web_axtree")
     ap.add_argument("--html_field", default="cleaned_html", choices=["raw_html", "cleaned_html"])
     args = ap.parse_args()
 
-    print(f"Loading {DATASET_NAME} split='{args.split}'...")
-    ds = load_dataset(DATASET_NAME, split=args.split)
+    split_path = Path(args.data_dir) / args.split
+    if not split_path.exists():
+        raise FileNotFoundError(
+            f"Split not found: {split_path}\n"
+            "Run download_mind2web.py first."
+        )
+    print(f"Loading split '{args.split}' from disk: {split_path}")
+    ds = load_from_disk(str(split_path))
 
     axtree_json_col = []
     axtree_text_col = []

@@ -40,10 +40,18 @@ class Mind2WebDataloaderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             mind2web_dataloader.MultimodalMind2WebDataset(split="val")
 
-    @patch("mind2web_dataloader.load_dataset")
-    def test_getitem_maps_expected_fields(self, mock_load_dataset):
-        mock_load_dataset.return_value = _DummyHFDataset([self.sample_row])
-        ds = mind2web_dataloader.MultimodalMind2WebDataset(split="test_website")
+    def test_missing_local_dir_raises(self):
+        with self.assertRaises(ValueError):
+            mind2web_dataloader.MultimodalMind2WebDataset(split="test_website")
+
+    @patch("mind2web_dataloader.load_from_disk")
+    def test_getitem_maps_expected_fields(self, mock_load_from_disk):
+        mock_load_from_disk.return_value = _DummyHFDataset([self.sample_row])
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "test_website").mkdir()
+            ds = mind2web_dataloader.MultimodalMind2WebDataset(
+                split="test_website", local_dir=tmp
+            )
         sample = ds[0]
 
         self.assertEqual(sample["annotation_id"], "ann_1")
@@ -52,12 +60,14 @@ class Mind2WebDataloaderTests(unittest.TestCase):
         self.assertEqual(sample["target_action_index"], "0")
         self.assertEqual(sample["html"], "<button>Submit</button>")
 
-    @patch("mind2web_dataloader.load_dataset")
-    def test_max_html_chars_applied(self, mock_load_dataset):
-        mock_load_dataset.return_value = _DummyHFDataset([self.sample_row])
-        ds = mind2web_dataloader.MultimodalMind2WebDataset(
-            split="test_website", max_html_chars=10, html_field="raw_html"
-        )
+    @patch("mind2web_dataloader.load_from_disk")
+    def test_max_html_chars_applied(self, mock_load_from_disk):
+        mock_load_from_disk.return_value = _DummyHFDataset([self.sample_row])
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "test_website").mkdir()
+            ds = mind2web_dataloader.MultimodalMind2WebDataset(
+                split="test_website", local_dir=tmp, max_html_chars=10, html_field="raw_html"
+            )
         self.assertEqual(ds[0]["html"], "<html><but")
 
     def test_local_dir_missing_split_raises(self):

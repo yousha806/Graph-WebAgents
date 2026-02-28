@@ -17,7 +17,7 @@ import os
 from pathlib import Path
 from typing import List
 
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 
 DATASET_NAME = "osunlp/Multimodal-Mind2Web"
 VALID_SPLITS = ["train", "test_task", "test_website", "test_domain"]
@@ -74,13 +74,18 @@ def _download_and_save_split(
     output_dir: str,
 ) -> tuple[str, int, str, str]:
     """Worker function: load one split from HF and save to disk."""
+    split_path = Path(output_dir) / split
+    if split_path.exists():
+        existing = load_from_disk(str(split_path))
+        print(f"  {split} already on disk ({len(existing)} records) — skipping download.")
+        return split, len(existing), str(split_path), split
+
     split_selector = _build_split_selector(split, subset_fraction)
     split_dataset = load_dataset(
         DATASET_NAME,
         split=split_selector,
         cache_dir=cache_dir,
     )
-    split_path = Path(output_dir) / split
     split_dataset.save_to_disk(str(split_path))
     return split, len(split_dataset), str(split_path), split_selector
 

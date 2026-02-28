@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from datasets import load_dataset, load_from_disk
+from datasets import load_from_disk
 from torch.utils.data import DataLoader, Dataset
 
 DATASET_NAME = "osunlp/Multimodal-Mind2Web"
@@ -46,13 +46,15 @@ class MultimodalMind2WebDataset(Dataset):
         if split not in VALID_SPLITS:
             raise ValueError(f"split must be one of {VALID_SPLITS}, got '{split}'")
 
-        if local_dir is not None:
-            split_path = Path(local_dir) / split
-            if not split_path.exists():
-                raise FileNotFoundError(f"Local split not found: {split_path}")
-            self.dataset = load_from_disk(str(split_path))
-        else:
-            self.dataset = load_dataset(DATASET_NAME, split=split)
+        if local_dir is None:
+            raise ValueError(
+                "local_dir is required. Run download_mind2web.py first, then pass "
+                "the output directory as local_dir."
+            )
+        split_path = Path(local_dir) / split
+        if not split_path.exists():
+            raise FileNotFoundError(f"Local split not found: {split_path}")
+        self.dataset = load_from_disk(str(split_path))
 
         self.split = split
         self.max_html_chars = max_html_chars

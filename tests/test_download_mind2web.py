@@ -18,6 +18,15 @@ class _DummyDataset:
         self.saved_path = path
 
 
+class _DummyDiskDataset:
+    """Minimal stand-in for a dataset loaded from disk."""
+    def __init__(self, length=3):
+        self._length = length
+
+    def __len__(self):
+        return self._length
+
+
 class DownloadMind2WebTests(unittest.TestCase):
     def test_build_split_selector_none(self):
         self.assertEqual(download_mind2web._build_split_selector("train", None), "train")
@@ -50,6 +59,30 @@ class DownloadMind2WebTests(unittest.TestCase):
                 split="test_website[:10%]",
                 cache_dir="C:/tmp/cache",
             )
+
+    @patch("download_mind2web.load_from_disk")
+    @patch("download_mind2web.load_dataset")
+    def test_download_skips_existing_split(self, mock_load_dataset, mock_load_from_disk):
+        """If the split directory already exists, load_dataset must not be called."""
+        mock_load_from_disk.return_value = _DummyDiskDataset(length=5)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Pre-create the split directory so the existence check triggers
+            split_dir = Path(tmp) / "test_website"
+            split_dir.mkdir()
+
+            split, count, out_path, selector = download_mind2web._download_and_save_split(
+                split="test_website",
+                subset_fraction=None,
+                cache_dir=None,
+                output_dir=tmp,
+            )
+
+            mock_load_dataset.assert_not_called()
+            mock_load_from_disk.assert_called_once_with(str(split_dir))
+            self.assertEqual(split, "test_website")
+            self.assertEqual(count, 5)
+            self.assertEqual(selector, "test_website")
 
 
 if __name__ == "__main__":
