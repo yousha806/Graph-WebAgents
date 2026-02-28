@@ -203,6 +203,12 @@ def main():
             f"Split not found: {split_path}\n"
             "Run download_mind2web.py first."
         )
+
+    save_path = Path(args.out_dir) / args.split
+    if save_path.exists():
+        print(f"AXTree split '{args.split}' already on disk at {save_path} — skipping.")
+        return
+
     print(f"Loading split '{args.split}' from disk: {split_path}")
     ds = load_from_disk(str(split_path))
 
@@ -223,8 +229,8 @@ def main():
     ds = ds.add_column("axtree_json", axtree_json_col)
     ds = ds.add_column("axtree_text", axtree_text_col)
 
-    save_path = f"{args.out_dir}/{args.split}"
-    ds.save_to_disk(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    ds.save_to_disk(str(save_path))
     print(f"Saved: {save_path}")
 
 if __name__ == "__main__":

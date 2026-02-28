@@ -8,6 +8,7 @@ huggingface_hub>=0.24.0
 safetensors>=0.4.0
 sentencepiece>=0.2.0
 einops>=0.8.0
+timm>=0.9.0           # required by InternVL2's vision backbone (InternViT)
 
 # Image handling
 Pillow>=10.0.0

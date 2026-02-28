@@ -122,15 +122,31 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
         "trust_remote_code": True,
         "torch_dtype": dtype,
         "low_cpu_mem_usage": True,
-        "device_map": "auto",
     }
+
     if quantization_config is not None:
+        # bitsandbytes requires device_map; use the dict form {"": 0} instead of
+        # "auto" to avoid accelerate's meta-device dispatch, which breaks
+        # InternVL2's InternVisionEncoder.__init__ (calls .item() on linspace
+        # during construction — invalid on meta tensors).
         model_kwargs["quantization_config"] = quantization_config
+        model_kwargs["device_map"] = {"": 0}
+    else:
+        # For non-quantized loads, skip device_map entirely (avoids meta tensors)
+        # and move to CUDA manually after loading.  This follows the official
+        # InternVL2 loading pattern from the HuggingFace model card.
+        pass
 
     model = AutoModel.from_pretrained(
         model_name,
         **model_kwargs,
     )
+
+    if quantization_config is None:
+        # Move to GPU now that the model is fully initialised on CPU.
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+
     model.eval()
     if not hasattr(model, "chat"):
         raise RuntimeError(

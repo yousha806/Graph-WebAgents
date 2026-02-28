@@ -107,6 +107,11 @@ else
   exit 1
 fi
 
+# Put conda's bin on PATH immediately so that subsequent subshells, nohup
+# processes, and any direct 'conda' calls in this session all work without
+# needing the user to source ~/.bashrc first.
+export PATH="$CONDA_BASE/bin:$PATH"
+
 # shellcheck disable=SC1091
 source "$CONDA_BASE/etc/profile.d/conda.sh"
 
