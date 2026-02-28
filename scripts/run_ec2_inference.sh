@@ -15,6 +15,7 @@ CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
 INFERENCE_DTYPE="${INFERENCE_DTYPE:-bf16}"
 QUANTIZATION="${QUANTIZATION:-none}"
+HF_TOKEN="${HF_TOKEN:-}"
 ENABLE_S3_SYNC="${ENABLE_S3_SYNC:-1}"
 S3_PREFIX="${S3_PREFIX:-intern_axtree_ablations}"
 S3_SYNC_INTERVAL_SEC="${S3_SYNC_INTERVAL_SEC:-300}"
@@ -25,7 +26,8 @@ AXTREE_DIR="${AXTREE_DIR:-$PROJECT_DIR/data/mind2web_axtree}"
 OUTPUT_DIR="${OUTPUT_DIR:-$HOME/outputs/intern_axtree_ablations}"
 LOG_DIR="${LOG_DIR:-$HOME/logs}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
-VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv}"
+MINICONDA_DIR="${MINICONDA_DIR:-$HOME/miniconda3}"
+AWSCLI_INSTALL_DIR="${AWSCLI_INSTALL_DIR:-$HOME/awscli-v2}"
 
 SPLITS=(test_task test_website test_domain)
 
@@ -78,71 +80,99 @@ if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
   fi
 fi
 
-# Activate conda in non-interactive shell; fallback to venv if conda is unavailable.
-if command -v conda >/dev/null 2>&1; then
-  CONDA_BASE="$(conda info --base)"
-  # shellcheck disable=SC1091
-  source "$CONDA_BASE/etc/profile.d/conda.sh"
+# Conda-only flow: install Miniconda automatically if conda is unavailable.
+if ! command -v conda >/dev/null 2>&1; then
+  echo "Conda not found in PATH. Installing Miniconda to $MINICONDA_DIR ..."
 
-  if [[ -n "$CONDA_ENV_PREFIX" ]]; then
-    if [[ ! -d "$CONDA_ENV_PREFIX" ]]; then
-      echo "Creating conda env at prefix: $CONDA_ENV_PREFIX (python=$PYTHON_VERSION)"
-      conda create -y -p "$CONDA_ENV_PREFIX" "python=$PYTHON_VERSION"
-    fi
-    conda activate "$CONDA_ENV_PREFIX"
-  elif [[ -n "$CONDA_ENV_NAME" ]]; then
-    if ! conda env list | awk '{print $1}' | grep -Fxq "$CONDA_ENV_NAME"; then
-      echo "Creating conda env: $CONDA_ENV_NAME (python=$PYTHON_VERSION)"
-      conda create -y -n "$CONDA_ENV_NAME" "python=$PYTHON_VERSION"
-    fi
-    conda activate "$CONDA_ENV_NAME"
-  else
-    echo "Error: set CONDA_ENV_NAME or CONDA_ENV_PREFIX before running this script."
-    echo "Example: CONDA_ENV_NAME=webagent ./scripts/run_ec2_inference.sh"
-    exit 1
-  fi
-else
-  echo "Conda not found in PATH. Falling back to Python venv at $VENV_DIR"
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "Error: python3 not found; cannot create venv fallback."
-    exit 1
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update -y || true
+    sudo apt-get install -y wget bzip2 || true
   fi
 
-  if [[ ! -d "$VENV_DIR" ]]; then
-    python3 -m venv "$VENV_DIR"
-  fi
-
-  # shellcheck disable=SC1091
-  source "$VENV_DIR/bin/activate"
+  INSTALLER="/tmp/miniconda_installer.sh"
+  wget -O "$INSTALLER" "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+  bash "$INSTALLER" -b -p "$MINICONDA_DIR"
 fi
 
+if [[ -x "$MINICONDA_DIR/bin/conda" ]]; then
+  CONDA_BASE="$MINICONDA_DIR"
+elif command -v conda >/dev/null 2>&1; then
+  CONDA_BASE="$(conda info --base)"
+else
+  echo "Error: conda is unavailable and Miniconda install did not succeed."
+  exit 1
+fi
+
+# shellcheck disable=SC1091
+source "$CONDA_BASE/etc/profile.d/conda.sh"
+
+if [[ -n "$CONDA_ENV_PREFIX" ]]; then
+  if [[ ! -d "$CONDA_ENV_PREFIX" ]]; then
+    echo "Creating conda env at prefix: $CONDA_ENV_PREFIX (python=$PYTHON_VERSION)"
+    conda create -y -p "$CONDA_ENV_PREFIX" "python=$PYTHON_VERSION"
+  fi
+  conda activate "$CONDA_ENV_PREFIX"
+elif [[ -n "$CONDA_ENV_NAME" ]]; then
+  if ! conda env list | awk '{print $1}' | grep -Fxq "$CONDA_ENV_NAME"; then
+    echo "Creating conda env: $CONDA_ENV_NAME (python=$PYTHON_VERSION)"
+    conda create -y -n "$CONDA_ENV_NAME" "python=$PYTHON_VERSION"
+  fi
+  conda activate "$CONDA_ENV_NAME"
+else
+  echo "Error: set CONDA_ENV_NAME or CONDA_ENV_PREFIX before running this script."
+  echo "Example: CONDA_ENV_NAME=webagent ./scripts/run_ec2_inference.sh"
+  exit 1
+fi
+
+# ---------- Verify conda env is active and will be used for ALL python calls ----------
+ACTIVE_CONDA_ENV="$(conda info --envs | awk '/\*/ {print $1}')" 
+PYTHON_BIN="$(command -v python)"
+if [[ "$PYTHON_BIN" != "$CONDA_BASE"* && "$PYTHON_BIN" != *"/envs/"* ]]; then
+  echo "Error: python resolved to '$PYTHON_BIN', which is outside the conda base '$CONDA_BASE'."
+  echo "Conda env activation may have failed."
+  exit 1
+fi
+echo "--------------------------------------------------------------"
+echo "Conda env : $ACTIVE_CONDA_ENV"
+echo "Python    : $PYTHON_BIN"
+echo "Splits    : ${SPLITS[*]} (test-only, no train)"
+echo "--------------------------------------------------------------"
+
 python -m pip install --upgrade pip
-pip install -r requirements.txt -r baselines/requirements.txt
+# Install all deps; pass the PyTorch CUDA index so bitsandbytes gets the right CUDA-matched wheel
+pip install \
+  -r requirements.txt \
+  -r baselines/requirements.txt \
+  --extra-index-url https://download.pytorch.org/whl/cu121
 
 if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
   if ! command -v aws >/dev/null 2>&1; then
-    echo "aws CLI not found; attempting install via apt..."
+    echo "aws CLI v2 not found; installing from official AWS installer..."
     if command -v apt-get >/dev/null 2>&1; then
       sudo apt-get update -y || true
-      sudo apt-get install -y awscli || true
+      sudo apt-get install -y unzip curl || true
     fi
+    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+    unzip -q /tmp/awscliv2.zip -d /tmp/awscliv2
+    sudo /tmp/awscliv2/aws/install --install-dir "$AWSCLI_INSTALL_DIR" --bin-dir /usr/local/bin
+    rm -rf /tmp/awscliv2 /tmp/awscliv2.zip
   fi
 
   if ! command -v aws >/dev/null 2>&1; then
-    echo "aws CLI still not found; attempting install via pip --user..."
-    python -m pip install --user awscli
-    export PATH="$HOME/.local/bin:$PATH"
-  fi
-
-  if ! command -v aws >/dev/null 2>&1; then
-    echo "Error: aws CLI not found and automatic installation failed."
-    echo "Install manually: sudo apt-get install -y awscli"
+    echo "Error: aws CLI v2 installation failed."
     exit 1
   fi
+  echo "Using: $(aws --version)"
 fi
 
 # Needed for precompute_axtree.py
 playwright install chromium
+
+# Export env vars so subprocesses (heredocs, parallel workers) can read them
+export MODEL_NAME HF_CACHE_DIR HF_TOKEN
+# Point HF dataset cache to our chosen dir for both download + precompute steps
+export HF_DATASETS_CACHE="$HF_CACHE_DIR/datasets"
+export HUGGINGFACE_HUB_CACHE="$HF_CACHE_DIR/hub"
 
 # ---------- Pre-download Intern model/checkpoint artifacts ----------
 python - <<'PY'
@@ -150,10 +180,10 @@ import os
 from huggingface_hub import snapshot_download
 
 model_name = os.environ.get("MODEL_NAME", "OpenGVLab/InternVL2-8B")
-cache_dir = os.environ.get("HF_CACHE_DIR")
+cache_dir = os.environ.get("HUGGINGFACE_HUB_CACHE")
 token = os.environ.get("HF_TOKEN") or None
 
-print(f"Pre-downloading model: {model_name}")
+print(f"Pre-downloading model: {model_name} → cache: {cache_dir}")
 local_path = snapshot_download(
     repo_id=model_name,
     cache_dir=cache_dir,
@@ -204,22 +234,30 @@ nohup python inference/intern_axtree_ablations.py \
 PID=$!
 
 if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
+  SYNC_LOG="$LOG_DIR/s3_sync_$(date +%Y%m%d_%H%M%S).log"
   (
     while kill -0 "$PID" >/dev/null 2>&1; do
-      sync_to_s3 || true
+      sync_to_s3 || echo "[sync] WARNING: sync_to_s3 returned non-zero" >&2
       sleep "$S3_SYNC_INTERVAL_SEC"
     done
 
+    echo "[sync] Inference finished (PID $PID). Generating final metrics..."
     METRICS_OUT="$OUTPUT_DIR/metrics_summary.json"
     if ls "$OUTPUT_DIR"/preds_*.jsonl >/dev/null 2>&1; then
       python inference/eval_next_action.py \
         --input "$OUTPUT_DIR" \
         --pattern "preds_*.jsonl" \
-        --out "$METRICS_OUT" || true
+        --out "$METRICS_OUT" \
+        && echo "[sync] Metrics written: $METRICS_OUT" \
+        || echo "[sync] WARNING: eval_next_action.py failed" >&2
+    else
+      echo "[sync] No prediction JSONL files found; skipping metrics."
     fi
 
-    sync_to_s3 || true
-  ) >/dev/null 2>&1 &
+    echo "[sync] Final S3 push..."
+    sync_to_s3 || echo "[sync] WARNING: final sync_to_s3 returned non-zero" >&2
+    echo "[sync] Done."
+  ) >> "$SYNC_LOG" 2>&1 &
   SYNC_PID=$!
 fi
 
@@ -228,13 +266,18 @@ echo "Baselines: intern_image_allinputs_axtree, intern_image_allinputs_axtree_co
 echo "PID: $PID"
 if [[ -n "${SYNC_PID:-}" ]]; then
   echo "S3 sync watcher PID: $SYNC_PID"
+  echo "Sync log: $SYNC_LOG"
 fi
-echo "Log: $RUN_LOG"
+echo "Inference log: $RUN_LOG"
 echo "Outputs: $OUTPUT_DIR"
 echo ""
 echo "Monitor with:"
 echo "  tail -f $RUN_LOG"
+if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
+  echo "  tail -f $SYNC_LOG"
+fi
 echo "  wc -l $OUTPUT_DIR/*.jsonl"
 if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
-  echo "  aws s3 ls $S3_ACCESS_POINT_URI/$S3_PREFIX/outputs"
+  echo "  aws s3 ls $S3_ACCESS_POINT_URI/$S3_PREFIX/outputs/"
+  echo "  aws s3 ls $S3_ACCESS_POINT_URI/$S3_PREFIX/logs/"
 fi
