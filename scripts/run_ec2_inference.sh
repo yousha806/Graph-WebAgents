@@ -75,10 +75,6 @@ if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
       exit 1
     fi
   fi
-  if ! command -v aws >/dev/null 2>&1; then
-    echo "Error: aws CLI not found but ENABLE_S3_SYNC=1."
-    exit 1
-  fi
 fi
 
 # Activate conda in non-interactive shell
@@ -111,6 +107,28 @@ fi
 
 python -m pip install --upgrade pip
 pip install -r requirements.txt -r baselines/requirements.txt
+
+if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "aws CLI not found; attempting install via apt..."
+    if command -v apt-get >/dev/null 2>&1; then
+      sudo apt-get update -y || true
+      sudo apt-get install -y awscli || true
+    fi
+  fi
+
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "aws CLI still not found; attempting install via pip --user..."
+    python -m pip install --user awscli
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
+
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "Error: aws CLI not found and automatic installation failed."
+    echo "Install manually: sudo apt-get install -y awscli"
+    exit 1
+  fi
+fi
 
 # Needed for precompute_axtree.py
 playwright install chromium
