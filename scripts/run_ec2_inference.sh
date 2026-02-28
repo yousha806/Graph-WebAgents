@@ -25,6 +25,7 @@ AXTREE_DIR="${AXTREE_DIR:-$PROJECT_DIR/data/mind2web_axtree}"
 OUTPUT_DIR="${OUTPUT_DIR:-$HOME/outputs/intern_axtree_ablations}"
 LOG_DIR="${LOG_DIR:-$HOME/logs}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
+VENV_DIR="${VENV_DIR:-$PROJECT_DIR/.venv}"
 
 SPLITS=(test_task test_website test_domain)
 
@@ -77,32 +78,42 @@ if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
   fi
 fi
 
-# Activate conda in non-interactive shell
+# Activate conda in non-interactive shell; fallback to venv if conda is unavailable.
 if command -v conda >/dev/null 2>&1; then
   CONDA_BASE="$(conda info --base)"
   # shellcheck disable=SC1091
   source "$CONDA_BASE/etc/profile.d/conda.sh"
-else
-  echo "Error: conda is not available in PATH."
-  exit 1
-fi
 
-if [[ -n "$CONDA_ENV_PREFIX" ]]; then
-  if [[ ! -d "$CONDA_ENV_PREFIX" ]]; then
-    echo "Creating conda env at prefix: $CONDA_ENV_PREFIX (python=$PYTHON_VERSION)"
-    conda create -y -p "$CONDA_ENV_PREFIX" "python=$PYTHON_VERSION"
+  if [[ -n "$CONDA_ENV_PREFIX" ]]; then
+    if [[ ! -d "$CONDA_ENV_PREFIX" ]]; then
+      echo "Creating conda env at prefix: $CONDA_ENV_PREFIX (python=$PYTHON_VERSION)"
+      conda create -y -p "$CONDA_ENV_PREFIX" "python=$PYTHON_VERSION"
+    fi
+    conda activate "$CONDA_ENV_PREFIX"
+  elif [[ -n "$CONDA_ENV_NAME" ]]; then
+    if ! conda env list | awk '{print $1}' | grep -Fxq "$CONDA_ENV_NAME"; then
+      echo "Creating conda env: $CONDA_ENV_NAME (python=$PYTHON_VERSION)"
+      conda create -y -n "$CONDA_ENV_NAME" "python=$PYTHON_VERSION"
+    fi
+    conda activate "$CONDA_ENV_NAME"
+  else
+    echo "Error: set CONDA_ENV_NAME or CONDA_ENV_PREFIX before running this script."
+    echo "Example: CONDA_ENV_NAME=webagent ./scripts/run_ec2_inference.sh"
+    exit 1
   fi
-  conda activate "$CONDA_ENV_PREFIX"
-elif [[ -n "$CONDA_ENV_NAME" ]]; then
-  if ! conda env list | awk '{print $1}' | grep -Fxq "$CONDA_ENV_NAME"; then
-    echo "Creating conda env: $CONDA_ENV_NAME (python=$PYTHON_VERSION)"
-    conda create -y -n "$CONDA_ENV_NAME" "python=$PYTHON_VERSION"
-  fi
-  conda activate "$CONDA_ENV_NAME"
 else
-  echo "Error: set CONDA_ENV_NAME or CONDA_ENV_PREFIX before running this script."
-  echo "Example: CONDA_ENV_NAME=webagent ./scripts/run_ec2_inference.sh"
-  exit 1
+  echo "Conda not found in PATH. Falling back to Python venv at $VENV_DIR"
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 not found; cannot create venv fallback."
+    exit 1
+  fi
+
+  if [[ ! -d "$VENV_DIR" ]]; then
+    python3 -m venv "$VENV_DIR"
+  fi
+
+  # shellcheck disable=SC1091
+  source "$VENV_DIR/bin/activate"
 fi
 
 python -m pip install --upgrade pip
