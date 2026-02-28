@@ -80,9 +80,9 @@ if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
   fi
 fi
 
-# Conda-only flow: install Miniconda automatically if conda is unavailable.
-if ! command -v conda >/dev/null 2>&1; then
-  echo "Conda not found in PATH. Installing Miniconda to $MINICONDA_DIR ..."
+# Conda-only flow: install Miniconda automatically if conda is not found anywhere.
+if ! command -v conda >/dev/null 2>&1 && [[ ! -x "$MINICONDA_DIR/bin/conda" ]]; then
+  echo "Conda not found. Installing Miniconda to $MINICONDA_DIR ..."
 
   if command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update -y || true
@@ -92,6 +92,10 @@ if ! command -v conda >/dev/null 2>&1; then
   INSTALLER="/tmp/miniconda_installer.sh"
   wget -O "$INSTALLER" "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
   bash "$INSTALLER" -b -p "$MINICONDA_DIR"
+elif [[ ! -x "$MINICONDA_DIR/bin/conda" ]] && command -v conda >/dev/null 2>&1; then
+  echo "Using existing conda from PATH."
+else
+  echo "Existing Miniconda found at $MINICONDA_DIR — skipping install."
 fi
 
 if [[ -x "$MINICONDA_DIR/bin/conda" ]]; then
