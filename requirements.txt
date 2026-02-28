@@ -1,8 +1,13 @@
 # Core
 datasets>=2.19.0
 torch>=2.1.0
+torchvision>=0.16.0
 transformers>=4.44.0
 accelerate>=0.33.0
+huggingface_hub>=0.24.0
+safetensors>=0.4.0
+sentencepiece>=0.2.0
+einops>=0.8.0
 
 # Image handling
 Pillow>=10.0.0
@@ -10,7 +15,7 @@ Pillow>=10.0.0
 # AXTree precomputation (headless browser)
 playwright>=1.40.0
 
-# Quantised inference (optional – only needed for 4-bit baselines)
+# Quantized inference (optional – needed for 4-bit/8-bit loading)
 bitsandbytes>=0.43.0
 
 # Misc
