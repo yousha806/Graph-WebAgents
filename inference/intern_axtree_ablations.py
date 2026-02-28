@@ -115,39 +115,60 @@ def build_quantization_config(mode: str, dtype: torch.dtype) -> Optional[BitsAnd
 
 
 def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for InternVL2-8B inference but no GPU was found.")
+
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=False)
     quantization_config = build_quantization_config(quantization, dtype)
 
-    model_kwargs: Dict[str, Any] = {
-        "trust_remote_code": True,
-        "torch_dtype": dtype,
-        "low_cpu_mem_usage": True,
-    }
+    # Flash Attention 2 gives ~2-4x speedup for long sequences by avoiding
+    # materializing the O(N^2) attention matrix in HBM. InternVL2 can produce
+    # up to 6144 image tokens (6 tiles × 1024), making FA2 highly beneficial.
+    # Requires Ampere+ GPU (compute ≥ 8.0: A10G, A100, H100).
+    # Automatically falls back to standard attention on older GPUs (T4=7.5, V100=7.0)
+    # or if flash-attn is not installed.
+    gpu_cc = torch.cuda.get_device_capability(0)
+    try:
+        import flash_attn  # noqa: F401
+        use_flash_attn = gpu_cc >= (8, 0)
+    except ImportError:
+        use_flash_attn = False
+
+    print(f"Loading Intern model: {model_name} (quantization={quantization}, dtype={dtype})")
+    print(f"GPU: {torch.cuda.get_device_name(0)}  |  "
+          f"compute={gpu_cc[0]}.{gpu_cc[1]}  |  "
+          f"VRAM free: {torch.cuda.mem_get_info(0)[0] / 1e9:.1f} GB  |  "
+          f"flash_attn={use_flash_attn}")
 
     if quantization_config is not None:
-        # bitsandbytes requires device_map; use the dict form {"": 0} instead of
-        # "auto" to avoid accelerate's meta-device dispatch, which breaks
-        # InternVL2's InternVisionEncoder.__init__ (calls .item() on linspace
-        # during construction — invalid on meta tensors).
-        model_kwargs["quantization_config"] = quantization_config
-        model_kwargs["device_map"] = {"": 0}
+        # Quantized path: bitsandbytes requires device_map.
+        # Use {"": 0} (dict form, not "auto") — "auto" triggers accelerate's
+        # meta-device dispatch which breaks InternVL2's __init__ (.item() on linspace).
+        model_kwargs: Dict[str, Any] = {
+            "trust_remote_code": True,
+            "dtype": dtype,
+            "low_cpu_mem_usage": True,
+            "device_map": {"": 0},
+            "quantization_config": quantization_config,
+            "use_flash_attn": use_flash_attn,
+        }
+        model = AutoModel.from_pretrained(model_name, **model_kwargs)
     else:
-        # For non-quantized loads, skip device_map entirely (avoids meta tensors)
-        # and move to CUDA manually after loading.  This follows the official
-        # InternVL2 loading pattern from the HuggingFace model card.
-        pass
-
-    model = AutoModel.from_pretrained(
-        model_name,
-        **model_kwargs,
-    )
-
-    if quantization_config is None:
-        # Move to GPU now that the model is fully initialised on CPU.
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = model.to(device)
+        # Non-quantized path: omit BOTH device_map and low_cpu_mem_usage.
+        # Either flag triggers accelerate's meta-device init, which calls .item()
+        # on meta tensors inside InternVisionEncoder.__init__ and crashes.
+        # Load fully on CPU first, then move to GPU.
+        model = AutoModel.from_pretrained(
+            model_name,
+            trust_remote_code=True,
+            dtype=dtype,
+            use_flash_attn=use_flash_attn,
+        )
+        model = model.to("cuda")
 
     model.eval()
+    print(f"Model loaded on: {next(model.parameters()).device}")
+
     if not hasattr(model, "chat"):
         raise RuntimeError(
             f"Model '{model_name}' does not expose chat(). "
@@ -370,7 +391,6 @@ def main() -> None:
     args = parse_args()
     dtype = resolve_dtype(args.dtype)
 
-    print(f"Loading Intern model: {args.model_name} (quantization={args.quantization}, dtype={args.dtype})")
     model, tokenizer = load_intern_model(args.model_name, dtype, args.quantization)
 
     out_dir = Path(args.output_dir)

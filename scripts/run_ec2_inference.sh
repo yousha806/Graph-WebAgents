@@ -156,6 +156,58 @@ pip install \
   -r baselines/requirements.txt \
   --extra-index-url https://download.pytorch.org/whl/cu121
 
+# ---------- NVIDIA driver check ----------
+# Detect the EC2 instance family to know if a GPU is expected.
+INSTANCE_TYPE="$(curl -sf --connect-timeout 2 http://169.254.169.254/latest/meta-data/instance-type || echo "unknown")"
+echo "EC2 instance type: $INSTANCE_TYPE"
+
+IS_GPU_INSTANCE=0
+case "$INSTANCE_TYPE" in
+  g4dn.*|g5.*|g5g.*|p2.*|p3.*|p4d.*|p5.*) IS_GPU_INSTANCE=1 ;;
+esac
+
+if [[ "$IS_GPU_INSTANCE" == "1" ]]; then
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "GPU instance detected but nvidia-smi not found — installing NVIDIA drivers..."
+    sudo apt-get update -y
+    sudo apt-get install -y nvidia-utils-535 nvidia-driver-535
+    echo "NVIDIA drivers installed. A reboot is required."
+    echo "Please run: sudo reboot"
+    echo "Then re-run this script after reconnecting."
+    exit 1
+  fi
+  echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
+elif [[ "$IS_GPU_INSTANCE" == "0" && "$INSTANCE_TYPE" != "unknown" ]]; then
+  echo "ERROR: Instance type '$INSTANCE_TYPE' has no GPU."
+  echo "InternVL2-8B requires a GPU instance. Stop this instance and switch to:"
+  echo "  g4dn.xlarge  (T4,  16GB VRAM) — cheapest option"
+  echo "  g5.xlarge    (A10G, 24GB VRAM) — supports Flash Attention 2"
+  echo "  p3.2xlarge   (V100, 16GB VRAM)"
+  exit 1
+fi
+
+# Flash Attention 2: must be installed AFTER torch, with --no-build-isolation so the
+# build system finds the already-installed torch and CUDA headers.
+# Only useful on Ampere+ GPUs (compute >= 8.0: A10G, A100, H100).
+# Skipped automatically on older GPUs (T4=7.5) — the model falls back to standard attention.
+GPU_CC=$(python - <<'PY'
+import subprocess, sys
+try:
+    import torch
+    cc = torch.cuda.get_device_capability(0)
+    print(f"{cc[0]}.{cc[1]}")
+except Exception:
+    print("0.0")
+PY
+)
+echo "GPU compute capability: $GPU_CC"
+if python -c "import sys; cc=tuple(int(x) for x in '${GPU_CC}'.split('.')); sys.exit(0 if cc>=(8,0) else 1)" 2>/dev/null; then
+  echo "Ampere+ GPU detected — installing flash-attn (this takes ~10-15 min on first run)..."
+  pip install flash-attn --no-build-isolation || echo "WARNING: flash-attn install failed; will use standard attention."
+else
+  echo "GPU compute < 8.0 — skipping flash-attn (not supported on this GPU)."
+fi
+
 if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
   if ! command -v aws >/dev/null 2>&1; then
     echo "aws CLI v2 not found; installing from official AWS installer..."
