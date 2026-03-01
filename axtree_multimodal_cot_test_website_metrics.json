@@ -1,0 +1,29 @@
+{
+  "baseline": "axtree_multimodal_cot_test_website",
+  "n": 1019,
+  "parse_failure_rate": 0.023552502453385672,
+  "element_acc": 0.07556427870461237,
+  "action_acc": 0.32875368007850836,
+  "exact_match": 0.04317958783120707,
+  "task_success_rate": 0.014084507042253521,
+  "per_action": {
+    "CLICK": {
+      "precision": 0.8506666666666667,
+      "recall": 0.3857315598548972,
+      "f1": 0.5307820299500832,
+      "support": 827
+    },
+    "SELECT": {
+      "precision": 0.2,
+      "recall": 0.041666666666666664,
+      "f1": 0.06896551724137931,
+      "support": 72
+    },
+    "TYPE": {
+      "precision": 0.29545454545454547,
+      "recall": 0.10833333333333334,
+      "f1": 0.15853658536585366,
+      "support": 120
+    }
+  }
+}
