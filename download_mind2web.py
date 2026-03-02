@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--splits",
         nargs="+",
-        default=["test_website", "test_domain", "test_task"],
+        default=["test_website"],
         choices=VALID_SPLITS,
         help="Dataset splits to download",
     )
@@ -67,6 +67,24 @@ def _build_split_selector(split: str, subset_fraction: float | None) -> str:
     return f"{split}[:{percentage}%]"
 
 
+def _split_parquet_files(split: str) -> list[str] | None:
+    """Return repo-relative Parquet paths that belong to *split*, or None on failure.
+
+    HF's load_dataset(split=...) downloads ALL shard files to the local cache
+    before filtering to the requested split. By listing only the matching files
+    and passing them via data_files=, we avoid fetching other splits entirely.
+    """
+    try:
+        from huggingface_hub import list_repo_files
+        files = [
+            f for f in list_repo_files(DATASET_NAME, repo_type="dataset")
+            if f.endswith(".parquet") and split in f
+        ]
+        return files or None
+    except Exception:
+        return None
+
+
 def _download_and_save_split(
     split: str,
     subset_fraction: float | None,
@@ -80,12 +98,31 @@ def _download_and_save_split(
         print(f"  {split} already on disk ({len(existing)} records) — skipping download.")
         return split, len(existing), str(split_path), split
 
-    split_selector = _build_split_selector(split, subset_fraction)
-    split_dataset = load_dataset(
-        DATASET_NAME,
-        split=split_selector,
-        cache_dir=cache_dir,
-    )
+    # Try to fetch only this split's Parquet shards so we don't pull the full dataset.
+    split_files = _split_parquet_files(split)
+    if split_files:
+        print(f"  {split}: found {len(split_files)} shard(s) — downloading only those files.")
+        split_dataset = load_dataset(
+            DATASET_NAME,
+            data_files=split_files,
+            split="train",
+            cache_dir=cache_dir,
+        )
+        # Apply subset_fraction manually (slice selector doesn't work with data_files=).
+        if subset_fraction is not None and subset_fraction < 1:
+            n = max(1, int(len(split_dataset) * subset_fraction))
+            split_dataset = split_dataset.select(range(n))
+        split_selector = split
+    else:
+        # Fallback: let HF resolve the split normally (may download all shards).
+        split_selector = _build_split_selector(split, subset_fraction)
+        print(f"  {split}: could not list repo files — falling back to split selector.")
+        split_dataset = load_dataset(
+            DATASET_NAME,
+            split=split_selector,
+            cache_dir=cache_dir,
+        )
+
     split_dataset.save_to_disk(str(split_path))
     return split, len(split_dataset), str(split_path), split_selector
 

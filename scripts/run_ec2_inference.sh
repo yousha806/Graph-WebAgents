@@ -125,7 +125,12 @@ echo "Splits    : ${SPLITS[*]} (test-only, no train)"
 echo "--------------------------------------------------------------"
 
 python -m pip install --upgrade pip
-# Install all deps; pass the PyTorch CUDA index so bitsandbytes gets the right CUDA-matched wheel
+# Pin torch to cu121 BEFORE installing requirements so pip does not pull a newer
+# cu12x build from PyPI. cu121 requires driver >= 520; nvidia-driver-535 satisfies this.
+# Using --index-url (not --extra-index-url) forces resolution from the pytorch index only.
+pip install "torch>=2.1.0,<3.0" torchvision \
+  --index-url https://download.pytorch.org/whl/cu121
+# Install remaining deps; torch is already satisfied so it will not be reinstalled.
 pip install \
   -r requirements.txt \
   -r baselines/requirements.txt \
@@ -213,6 +218,44 @@ for split in "${SPLITS[@]}"; do
     --data_dir "$DATA_DIR" \
     --out_dir "$AXTREE_DIR"
 done
+
+# ---------- CUDA pre-flight check ----------
+# Run synchronously so failures surface immediately rather than being buried in the nohup log.
+python - <<'PY'
+import sys
+import torch
+
+if not torch.cuda.is_available():
+    drv = "unknown"
+    try:
+        import subprocess
+        out = subprocess.check_output(["nvidia-smi", "--query-gpu=driver_version",
+                                       "--format=csv,noheader"], text=True).strip()
+        drv = out.splitlines()[0]
+    except Exception:
+        pass
+    print(
+        f"ERROR: torch.cuda.is_available() = False\n"
+        f"  torch version      : {torch.__version__}\n"
+        f"  torch CUDA build   : {torch.version.cuda}\n"
+        f"  nvidia-smi driver  : {drv}\n"
+        f"\n"
+        f"  Most likely causes:\n"
+        f"    1. Driver version too old for this CUDA build.\n"
+        f"       cu121 requires driver >= 520; cu124 requires >= 550.\n"
+        f"    2. NVIDIA kernel module not loaded — reboot after driver install.\n"
+        f"    3. /dev/nvidia* not accessible (check permissions).",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+dev = torch.cuda.current_device()
+print(
+    f"CUDA OK: {torch.cuda.get_device_name(dev)} | "
+    f"VRAM free: {torch.cuda.mem_get_info(dev)[0]/1e9:.1f} GB | "
+    f"torch {torch.__version__} (CUDA {torch.version.cuda})"
+)
+PY
 
 # ---------- Launch detached inference ----------
 RUN_LOG="$LOG_DIR/intern_axtree_ablations_$(date +%Y%m%d_%H%M%S).log"

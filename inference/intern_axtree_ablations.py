@@ -116,7 +116,14 @@ def build_quantization_config(mode: str, dtype: torch.dtype) -> Optional[BitsAnd
 
 def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for InternVL2-8B inference but no GPU was found.")
+        raise RuntimeError(
+            f"CUDA is required for InternVL2-8B inference but torch.cuda.is_available() returned False.\n"
+            f"  torch version    : {torch.__version__}\n"
+            f"  torch CUDA build : {torch.version.cuda}\n"
+            f"  Likely cause     : driver version too old for this CUDA build, or kernel module\n"
+            f"                     not loaded (reboot required after driver install).\n"
+            f"  cu121 needs driver >= 520; cu124 needs >= 550; cu128 needs >= 570."
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=False)
     quantization_config = build_quantization_config(quantization, dtype)
