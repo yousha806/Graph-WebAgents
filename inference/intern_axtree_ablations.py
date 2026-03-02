@@ -22,13 +22,20 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from datasets import load_from_disk
 from PIL import Image
 from tqdm import tqdm
+from torchvision import transforms
+from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
+
+# InternVL2 image preprocessing constants (ImageNet normalisation, 448px tiles)
+_INTERN_INPUT_SIZE = 448
+_INTERN_MEAN = (0.485, 0.456, 0.406)
+_INTERN_STD  = (0.229, 0.224, 0.225)
 
 DEFAULT_SPLITS = ["test_website"]
 
@@ -192,7 +199,7 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
         # meta-device dispatch which breaks InternVL2's __init__ (.item() on linspace).
         model_kwargs: Dict[str, Any] = {
             "trust_remote_code": True,
-            "dtype": dtype,
+            "torch_dtype": dtype,
             "low_cpu_mem_usage": True,
             "device_map": {"": 0},
             "quantization_config": quantization_config,
@@ -201,13 +208,15 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
         model = AutoModel.from_pretrained(model_name, **model_kwargs)
     else:
         # Non-quantized path: load on CPU then move to GPU.
+        # torch_dtype is a recognised from_pretrained kwarg (handled before cls.__init__
+        # is called), so it is never forwarded to InternVLChatModel.__init__().
         # low_cpu_mem_usage=False disables accelerate's meta-device init; the
         # _patch_internvl2_meta_device_issue() call above fixes the root cause
         # in the model source so this also works if meta init occurs anyway.
         model = AutoModel.from_pretrained(
             model_name,
             trust_remote_code=True,
-            dtype=dtype,
+            torch_dtype=dtype,
             low_cpu_mem_usage=False,
             use_flash_attn=use_flash_attn,
         )
@@ -324,35 +333,43 @@ def normalize_gt_operation(operation_field: Any) -> Optional[str]:
     return None
 
 
+def pil_to_pixel_values(image: Image.Image, dtype: torch.dtype) -> torch.Tensor:
+    """Preprocess a PIL image into the InternVL2 pixel_values tensor.
+
+    InternVL2's chat() expects a CUDA tensor of shape (1, 3, 448, 448) with
+    ImageNet normalisation, not a raw PIL image.
+    """
+    transform = transforms.Compose([
+        transforms.Resize(
+            (_INTERN_INPUT_SIZE, _INTERN_INPUT_SIZE),
+            interpolation=InterpolationMode.BICUBIC,
+        ),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=_INTERN_MEAN, std=_INTERN_STD),
+    ])
+    return transform(image.convert("RGB")).unsqueeze(0).to(dtype=dtype, device="cuda")
+
+
 def run_intern_chat(
     model: Any,
     tokenizer: Any,
-    image: Image.Image,
+    pixel_values: torch.Tensor,
     prompt: str,
     generation_config: Dict[str, Any],
 ) -> str:
-    attempts: Iterable = [
-        lambda: model.chat(tokenizer, image, prompt, generation_config),
-        lambda: model.chat(tokenizer, prompt, image=image, generation_config=generation_config),
-        lambda: model.chat(tokenizer=tokenizer, query=prompt, image=image, generation_config=generation_config),
-        lambda: model.chat(tokenizer=tokenizer, pixel_values=image, question=prompt, generation_config=generation_config),
-    ]
+    """Call InternVL2 chat() with a preprocessed pixel_values tensor.
 
-    last_error: Optional[Exception] = None
-    for attempt in attempts:
-        try:
-            output = attempt()
-            if isinstance(output, tuple):
-                return str(output[0])
-            return str(output)
-        except TypeError as err:
-            last_error = err
-            continue
+    InternVL2's chat signature:
+        chat(tokenizer, pixel_values, question, generation_config) -> str
 
-    raise RuntimeError(
-        "Could not call InternVL2 chat() with known signatures. "
-        "Check your checkpoint's expected chat API."
-    ) from last_error
+    If pixel_values is None the model treats it as text-only.
+    The model prepends '<image>\\n' to the question automatically when
+    pixel_values is provided and the token is absent from the prompt.
+    """
+    output = model.chat(tokenizer, pixel_values, prompt, generation_config)
+    if isinstance(output, tuple):
+        return str(output[0])
+    return str(output)
 
 
 def make_prediction_record(
@@ -389,6 +406,7 @@ def run_single_baseline(
     split: str,
     baseline: Dict[str, Any],
     args: argparse.Namespace,
+    model_dtype: torch.dtype,
 ) -> int:
     generation_config = {
         "max_new_tokens": args.max_new_tokens,
@@ -416,6 +434,7 @@ def run_single_baseline(
         for idx in tqdm(iterator, desc=f"{baseline['name']} | {split}"):
             row = dataset[idx]
             image = to_pil_image(row["screenshot"])
+            pixel_values = pil_to_pixel_values(image, model_dtype)
             prompt = build_prompt(
                 row=row,
                 use_cot=baseline["cot"],
@@ -423,7 +442,7 @@ def run_single_baseline(
             )
 
             with torch.inference_mode():
-                raw_output = run_intern_chat(model, tokenizer, image, prompt, generation_config)
+                raw_output = run_intern_chat(model, tokenizer, pixel_values, prompt, generation_config)
 
             pred_idx = parse_predicted_index(raw_output, num_candidates=len(row.get("action_reprs", [])))
             record = make_prediction_record(row, split, baseline["name"], pred_idx, raw_output)
@@ -448,7 +467,7 @@ def main() -> None:
         for baseline in BASELINES:
             print(f"Running baseline '{baseline['name']}' on {split}")
             out_file = out_dir / f"preds_{baseline['name']}_{split}.jsonl"
-            num_written = run_single_baseline(model, tokenizer, dataset, split, baseline, args)
+            num_written = run_single_baseline(model, tokenizer, dataset, split, baseline, args, dtype)
             print(f"Updated predictions: {out_file} (new rows written: {num_written})")
 
 
