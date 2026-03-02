@@ -161,19 +161,20 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
         }
         model = AutoModel.from_pretrained(model_name, **model_kwargs)
     else:
-        # Non-quantized path: explicitly set low_cpu_mem_usage=False.
-        # transformers >= 4.38 defaults low_cpu_mem_usage=True when accelerate is
-        # installed, which triggers meta-device init and crashes InternVisionEncoder's
-        # __init__ (.item() on torch.linspace meta tensor). We must override it.
-        # No device_map either — load fully on CPU first, then move to GPU.
+        # Non-quantized path: use device_map={"": 0} to load directly to GPU.
+        # In transformers >= 4.45, low_cpu_mem_usage=False no longer prevents
+        # accelerate's meta-device init phase, so InternVL2's __init__ still
+        # crashes on .item() calls against meta tensors.
+        # device_map={"": 0} (dict, not "auto") allocates tensors directly on
+        # GPU device 0, bypassing the meta→CPU→GPU loading chain entirely.
         model = AutoModel.from_pretrained(
             model_name,
             trust_remote_code=True,
-            dtype=dtype,
-            low_cpu_mem_usage=False,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=True,
+            device_map={"": 0},
             use_flash_attn=use_flash_attn,
         )
-        model = model.to("cuda")
 
     model.eval()
     print(f"Model loaded on: {next(model.parameters()).device}")
