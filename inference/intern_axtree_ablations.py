@@ -273,11 +273,6 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
           f"VRAM free: {torch.cuda.mem_get_info(0)[0] / 1e9:.1f} GB  |  "
           f"flash_attn=False")
 
-    # Patch InternVL2's cached model code before loading so that the
-    # torch.linspace(...).item() call in InternVisionEncoder.__init__ does not
-    # crash when transformers runs __init__ inside a meta-device context.
-    _patch_internvl2_meta_device_issue()
-
     if quantization_config is not None:
         # Quantized path: bitsandbytes requires device_map.
         # Use {"": 0} (dict form, not "auto") — "auto" triggers accelerate's
@@ -292,20 +287,19 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
         }
         model = AutoModel.from_pretrained(model_name, **model_kwargs)
     else:
-        # Non-quantized path: load on CPU then move to GPU.
-        # torch_dtype is a recognised from_pretrained kwarg (handled before cls.__init__
-        # is called), so it is never forwarded to InternVLChatModel.__init__().
-        # low_cpu_mem_usage=False disables accelerate's meta-device init; the
-        # _patch_internvl2_meta_device_issue() call above fixes the root cause
-        # in the model source so this also works if meta init occurs anyway.
+        # Non-quantized path: use device_map={"": 0} to load directly onto GPU.
+        # This avoids the meta-device init path in accelerate/transformers, which
+        # triggers a torch.linspace(...).item() call inside InternVisionEncoder.__init__
+        # that crashes with "Tensor.item() cannot be called on meta tensors".
+        # device_map={"": 0} (dict, not "auto") pins all layers to cuda:0 without
+        # triggering accelerate's meta-device dispatch.
         model = AutoModel.from_pretrained(
             model_name,
             trust_remote_code=True,
             torch_dtype=dtype,
-            low_cpu_mem_usage=False,
+            device_map={"": 0},
             use_flash_attn=use_flash_attn,
         )
-        model = model.to("cuda")
 
     model.eval()
     print(f"Model loaded on: {next(model.parameters()).device}")
