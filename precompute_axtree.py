@@ -11,8 +11,11 @@ Example:
 
 import argparse
 import json
+import logging
 import re
 from pathlib import Path
+
+logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 
 from datasets import load_from_disk
 from playwright.sync_api import sync_playwright
@@ -32,32 +35,93 @@ def sanitize_html(html: str) -> str:
     html = re.sub(r"<link\b[^>]*>", "", html, flags=re.I)
     return html
 
+# Roles with no semantic meaning when name is also empty — skip them to
+# avoid polluting the model context with zero-signal lines.
+_NOISE_ROLES = {"", "generic", "none", "presentation", "group"}
+
+
 def flatten_axtree(snapshot: dict, max_nodes: int = 800, max_chars: int = 12000) -> str:
-    """Turn AXTree JSON into compact, model-friendly text."""
+    """Turn AXTree JSON into compact, model-friendly text.
+
+    Output format per node (one line, indented by depth)::
+
+        [role] "name"  (omitted when empty)  value="…"  disabled checked …  #id=123
+
+    Nodes that are both in a noise role (generic/none/presentation/group) and
+    have an empty name are skipped: they carry no signal for the model.
+    """
     if not snapshot:
         return ""
 
     lines = []
     stack = [(snapshot, 0)]
-    while stack and len(lines) < max_nodes:
+    truncated_nodes = False
+    truncated_chars = False
+    while stack:
+        if len(lines) >= max_nodes:
+            truncated_nodes = True
+            break
         node, depth = stack.pop()
-        role = node.get("role", "")
+        role = (node.get("role") or "").strip()
         name = (node.get("name") or "").strip()
-        value = node.get("value")
-        value_str = "" if value is None else f" value={str(value).strip()}"
 
-        line = ("  " * depth) + f"{role}: {name}{value_str}".strip()
-        lines.append(line)
+        # Skip structurally empty nodes — they only dilute the context budget.
+        if role in _NOISE_ROLES and not name:
+            children = node.get("children") or []
+            for c in reversed(children):
+                stack.append((c, depth))
+            continue
+
+        # Indent with "| " per level — each level is a distinct token pair,
+        # making the hierarchy unambiguous after tokenization. A plain-space
+        # approach produces variable-length whitespace runs that tokenizers
+        # merge inconsistently, losing the depth signal.
+        indent = "| " * depth
+        node_parts = []
+        if role:
+            node_parts.append(f"[{role}]")
+        if name:
+            node_parts.append(f'"{name}"')
+        value = node.get("value")
+        if value is not None:
+            node_parts.append(f"value={str(value).strip()!r}")
+        # Emit ARIA state flags that are set / truthy.
+        props = node.get("props") or {}
+        for pname, pval in props.items():
+            if pval is True:
+                node_parts.append(pname)          # e.g. "disabled"
+            else:
+                node_parts.append(f"{pname}={pval}")  # e.g. "haspopup=menu"
+        # Backend node id for grounding (helps model correlate with candidates).
+        bnode_id = node.get("backend_node_id")
+        if bnode_id is not None:
+            node_parts.append(f"#id={bnode_id}")
+
+        lines.append(indent + " ".join(node_parts))
 
         children = node.get("children") or []
         for c in reversed(children):
             stack.append((c, depth + 1))
 
         if sum(len(x) + 1 for x in lines) > max_chars:
+            truncated_chars = True
             break
 
+    if truncated_nodes:
+        logging.warning(
+            "flatten_axtree: node limit (%d) reached — tree is truncated. "
+            "Increase max_nodes to capture the full tree.",
+            max_nodes,
+        )
     text = "\n".join(lines)
-    return text[:max_chars]
+    if truncated_chars or len(text) > max_chars:
+        logging.warning(
+            "flatten_axtree: char limit (%d) reached — text will be clipped. "
+            "Increase max_chars to avoid losing content.",
+            max_chars,
+        )
+        text = text[:max_chars]
+    return text
 
 # Resource types that are safe to block when rendering static HTML.
 # We must keep "stylesheet" and "script" so Chrome can compute ARIA roles
@@ -71,7 +135,7 @@ def _block_unnecessary_resources(route):
     if route.request.resource_type in _BLOCK_RESOURCE_TYPES:
         route.abort()
     else:
-        route.abort()  # fallback: also abort fetch/xhr to real servers
+        route.continue_()  # allow stylesheets/scripts so ARIA roles are resolved
 
 
 def build_page(playwright):
@@ -81,7 +145,7 @@ def build_page(playwright):
     context = browser.new_context(java_script_enabled=True)
     # Block images/media/fonts for speed, but allow inline styles/scripts
     # that are already embedded in the HTML string.
-    context.route("**/*", lambda route: route.abort())
+    context.route("**/*", _block_unnecessary_resources)
     page = context.new_page()
     return browser, context, page
 
@@ -107,6 +171,24 @@ def _cdp_nodes_to_tree(nodes: list) -> dict:
 
     id_map = {n["nodeId"]: n for n in nodes if "nodeId" in n}
 
+    # ARIA boolean/string properties we want to surface in the text.
+    _ARIA_PROPS = {"disabled", "checked", "expanded", "required", "selected", "haspopup", "invalid"}
+
+    def _extract_props(node) -> dict:
+        """Return a dict of relevant ARIA property name → value from the
+        CDP ``properties`` array (each item: {name, value: {type, value}})."""
+        props = {}
+        for prop in node.get("properties", []):
+            pname = prop.get("name", "")
+            if pname not in _ARIA_PROPS:
+                continue
+            pval = prop.get("value", {})
+            v = pval.get("value") if isinstance(pval, dict) else pval
+            # Only include properties that are actually set / true.
+            if v is True or (isinstance(v, str) and v not in ("", "false", "none", "undefined")):
+                props[pname] = v
+        return props
+
     def _build(node) -> dict | None:
         # Skip nodes Chrome has marked as not contributing to accessibility.
         if node.get("ignored", False):
@@ -114,6 +196,7 @@ def _cdp_nodes_to_tree(nodes: list) -> dict:
         role = _field_value(node.get("role", {}))
         name = _field_value(node.get("name", {}))
         value = _field_value(node.get("value", {})) or None
+        props = _extract_props(node)
         # Recurse into children, dropping ignored subtrees.
         child_ids = node.get("childIds", [])
         children = [
@@ -126,6 +209,12 @@ def _cdp_nodes_to_tree(nodes: list) -> dict:
         result: dict = {"role": role, "name": name}
         if value:
             result["value"] = value
+        if props:
+            result["props"] = props
+        # Preserve backend DOM node id for element grounding.
+        bnode_id = node.get("backendDOMNodeId")
+        if bnode_id is not None:
+            result["backend_node_id"] = bnode_id
         if children:
             result["children"] = children
         return result
@@ -169,8 +258,8 @@ def html_to_axtree(page, html: str) -> dict:
         result = cdp.send("Accessibility.getFullAXTree", {})
         cdp.detach()
         return _cdp_nodes_to_tree(result.get("nodes", []))
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.warning("html_to_axtree: CDP Accessibility.getFullAXTree failed: %s", exc)
 
     # Legacy fallback for older Playwright versions that still expose the API.
     if hasattr(page, "accessibility") and page.accessibility is not None:
@@ -214,17 +303,44 @@ def main():
 
     axtree_json_col = []
     axtree_text_col = []
+    empty_snap_count = 0
 
     with sync_playwright() as p:
         browser, context, page = build_page(p)
         try:
             for ex in tqdm(ds, desc=f"AXTree [{args.split}]"):
-                snap = html_to_axtree(page, ex.get(args.html_field, ""))
+                html_src = ex.get(args.html_field, "") or ""
+                if not html_src.strip():
+                    logging.warning(
+                        "Empty %s for annotation_id=%s action_uid=%s — axtree will be empty.",
+                        args.html_field,
+                        ex.get("annotation_id", "?"),
+                        ex.get("action_uid", "?"),
+                    )
+                snap = html_to_axtree(page, html_src)
+                if not snap:
+                    empty_snap_count += 1
+                    logging.warning(
+                        "Empty AXTree for annotation_id=%s action_uid=%s "
+                        "(html_len=%d, row %d) — axtree_text will be blank.",
+                        ex.get("annotation_id", "?"),
+                        ex.get("action_uid", "?"),
+                        len(html_src),
+                        len(axtree_json_col),
+                    )
                 axtree_json_col.append(json.dumps(snap, ensure_ascii=False))
                 axtree_text_col.append(flatten_axtree(snap))
         finally:
             context.close()
             browser.close()
+
+    if empty_snap_count:
+        logging.warning(
+            "%d / %d rows produced an empty AXTree. "
+            "Check logs above for per-row details.",
+            empty_snap_count,
+            len(ds),
+        )
 
     ds = ds.add_column("axtree_json", axtree_json_col)
     ds = ds.add_column("axtree_text", axtree_text_col)

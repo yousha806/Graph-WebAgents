@@ -32,6 +32,68 @@ from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 
+# Optional: lm-format-enforcer for hard JSON-schema-constrained decoding.
+# Install with: pip install lm-format-enforcer
+# Without it the script still runs; --json_constrained will warn and be skipped.
+try:
+    from lm_format_enforcer import JsonSchemaParser
+    from lm_format_enforcer.integrations.transformers import (
+        build_transformers_prefix_allowed_tokens_fn,
+    )
+    _LM_FORMAT_ENFORCER_AVAILABLE = True
+except ImportError:
+    _LM_FORMAT_ENFORCER_AVAILABLE = False
+
+try:
+    from pydantic import BaseModel as _BaseModel
+
+    class _PredNoCoT(_BaseModel):
+        top3_action_indices: List[int]   # ranked best→worst, length 1-3
+        action_type: str
+        target_element: str
+
+    class _PredCoT(_BaseModel):
+        reasoning: str
+        top3_action_indices: List[int]   # ranked best→worst, length 1-3
+        action_type: str
+        target_element: str
+
+    _SCHEMA_NO_COT = _PredNoCoT.model_json_schema()
+    _SCHEMA_COT    = _PredCoT.model_json_schema()
+except ImportError:
+    # Pydantic unavailable: fall back to hand-written JSON Schema dicts.
+    _SCHEMA_NO_COT = {
+        "type": "object",
+        "properties": {
+            "top3_action_indices": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 1,
+                "maxItems": 3,
+            },
+            "action_type":     {"type": "string"},
+            "target_element":  {"type": "string"},
+        },
+        "required": ["top3_action_indices", "action_type", "target_element"],
+        "additionalProperties": False,
+    }
+    _SCHEMA_COT = {
+        "type": "object",
+        "properties": {
+            "reasoning":       {"type": "string"},
+            "top3_action_indices": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 1,
+                "maxItems": 3,
+            },
+            "action_type":     {"type": "string"},
+            "target_element":  {"type": "string"},
+        },
+        "required": ["reasoning", "top3_action_indices", "action_type", "target_element"],
+        "additionalProperties": False,
+    }
+
 # InternVL2 image preprocessing constants (ImageNet normalisation, 448px tiles)
 _INTERN_INPUT_SIZE = 448
 _INTERN_MEAN = (0.485, 0.456, 0.406)
@@ -43,10 +105,15 @@ BASELINES = [
     {
         "name": "intern_image_allinputs_axtree",
         "cot": False,
+        # Non-CoT output is a single integer (e.g. "3") — 32 tokens is generous.
+        "max_new_tokens": 32,
     },
     {
         "name": "intern_image_allinputs_axtree_cot",
         "cot": True,
+        # CoT needs a full reasoning chain before FINAL_ANSWER: <idx>.
+        # 512 tokens fits ~350 words of reasoning + the answer tag.
+        "max_new_tokens": 512,
     },
 ]
 
@@ -75,10 +142,38 @@ def parse_args() -> argparse.Namespace:
         default="inference_outputs/intern_axtree_ablations",
         help="Where to write JSONL predictions",
     )
-    parser.add_argument("--max_axtree_chars", type=int, default=6000)
-    parser.add_argument("--max_new_tokens", type=int, default=64)
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--max_axtree_chars", type=int, default=12000,
+        help=(
+            "Max characters of axtree_text to include in the prompt. "
+            "Matches the precompute_axtree.py default (max_chars=12000) so nothing is wasted. "
+            "\n\nToken budget for InternVL2-8B (32768-token context, 1-tile / 256 image tokens):\n"
+            "  image=256, boilerplate+task+candidates≈900, max_new_tokens≤512, margin=500\n"
+            "  → ~30,600 tokens / ~107,000 chars available for axtree.\n"
+            "Current practical ceiling = 12,000 chars (what precompute stores). "
+            "To go higher, rerun precompute_axtree.py with --max_chars <N> first."
+        ),
+    )
+    parser.add_argument(
+        "--max_new_tokens", type=int, default=None,
+        help="Override the per-baseline max_new_tokens (32 non-CoT, 512 CoT). "
+             "Rarely needed; set only to override the baseline defaults.",
+    )
+    parser.add_argument(
+        "--temperature", type=float, default=0.0,
+        help="Sampling temperature. 0.0 = greedy decoding (default, recommended for "
+             "deterministic evaluation). Values > 0 enable sampling.",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Optional max examples per split")
+    parser.add_argument(
+        "--json_constrained",
+        action="store_true",
+        help=(
+            "Enforce JSON-schema-valid output via constrained decoding (lm-format-enforcer). "
+            "Guarantees the model emits valid JSON — no regex fallback needed. "
+            "Requires: pip install lm-format-enforcer pydantic"
+        ),
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -262,11 +357,44 @@ def to_pil_image(image_field: Any) -> Image.Image:
 
 def truncate(text: str, max_chars: int) -> str:
     text = text or ""
-    return text[:max_chars]
+    if len(text) > max_chars:
+        import logging
+        logging.warning(
+            "build_prompt: axtree_text (%d chars) exceeds max_axtree_chars=%d "
+            "and will be clipped mid-line. Consider increasing --max_axtree_chars.",
+            len(text),
+            max_chars,
+        )
+        return text[:max_chars]
+    return text
 
 
 def candidate_lines(action_reprs: List[str]) -> str:
     return "\n".join(f"{idx}: {candidate}" for idx, candidate in enumerate(action_reprs))
+
+
+# JSON schema the model is asked to emit, templated per baseline type.
+_JSON_SCHEMA_NO_COT = '''\
+Respond with a single JSON object and nothing else.
+Rank your top-3 best candidate indices from most to least confident.
+If only one candidate clearly matches, you may list fewer.
+{
+  "top3_action_indices": [<best index>, <2nd best>, <3rd best>],
+  "action_type": <action verb for the best candidate, e.g. "CLICK", "TYPE", "SELECT">,
+  "target_element": <brief description of the element being acted on>
+}'''
+
+_JSON_SCHEMA_COT = '''\
+Respond with a single JSON object and nothing else.
+"reasoning" must appear first so you can think before committing to indices.
+Rank your top-3 best candidate indices from most to least confident.
+If only one candidate clearly matches, you may list fewer.
+{
+  "reasoning": <step-by-step explanation of which candidates match the task>,
+  "top3_action_indices": [<best index>, <2nd best>, <3rd best>],
+  "action_type": <action verb for the best candidate, e.g. "CLICK", "TYPE", "SELECT">,
+  "target_element": <brief description of the element being acted on>
+}'''
 
 
 def build_prompt(row: Dict[str, Any], use_cot: bool, max_axtree_chars: int) -> str:
@@ -274,38 +402,84 @@ def build_prompt(row: Dict[str, Any], use_cot: bool, max_axtree_chars: int) -> s
     axtree = truncate(row.get("axtree_text", ""), max_axtree_chars)
     actions = row.get("action_reprs", [])
 
-    cot_instructions = (
-        "Think through the page state and action options step by step. "
-        "Then output your final answer in this exact format: FINAL_ANSWER: <index>."
-        if use_cot
-        else "Output only the selected action index as a single integer."
-    )
+    schema = _JSON_SCHEMA_COT if use_cot else _JSON_SCHEMA_NO_COT
 
+    # Place <image> explicitly after the task so the model can cross-attend
+    # between the screenshot and the surrounding text context. If <image> is
+    # absent from the prompt string, InternVL2's chat() prepends it at position
+    # 0 (before everything), which severs that cross-attention relationship.
     return (
         "You are predicting the next web action for a browser agent.\n"
-        "Given task, AXTree, screenshot, and candidate actions, choose the correct action index.\n\n"
+        "Given task, screenshot, AXTree, and candidate actions, choose the correct action index.\n\n"
         f"Task:\n{task}\n\n"
-        f"AXTree (truncated):\n{axtree}\n\n"
+        "Screenshot:\n<image>\n\n"
+        f"AXTree:\n{axtree}\n\n"
         f"Candidate actions:\n{candidate_lines(actions)}\n\n"
-        f"{cot_instructions}"
+        f"{schema}"
     )
 
 
-def parse_predicted_index(raw_output: str, num_candidates: int) -> Optional[int]:
+def parse_model_output(raw_output: str, num_candidates: int) -> Dict[str, Any]:
+    """Parse the model's JSON response into a structured dict.
+
+    Tries JSON first (the instructed format), then falls back to regex so that
+    partial or malformed responses still yield usable indices.
+
+    Returns a dict with keys:
+        pred_action_indices : List[int]    — ranked top-1..3 candidate indices (empty if unparseable)
+        action_type         : str | None   — e.g. "CLICK" (for top-1)
+        target_element      : str | None   — element description from model
+        reasoning           : str | None   — CoT chain (None for non-CoT responses)
+        parse_error         : str | None   — description of any parse failure
+    """
+    result: Dict[str, Any] = {
+        "pred_action_indices": [],
+        "action_type": None,
+        "target_element": None,
+        "reasoning": None,
+        "parse_error": None,
+    }
     if not raw_output:
-        return None
+        result["parse_error"] = "empty output"
+        return result
 
-    tagged_match = re.search(r"FINAL_ANSWER\s*:\s*(-?\d+)", raw_output, flags=re.IGNORECASE)
-    if tagged_match:
-        value = int(tagged_match.group(1))
-        return value if 0 <= value < num_candidates else None
+    # --- 1. JSON parse (preferred) ---
+    # Strip markdown code fences the model sometimes wraps around JSON.
+    json_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_output.strip(), flags=re.S)
+    # Also handle output that has prose before/after the JSON object.
+    json_match = re.search(r"\{.*\}", json_text, flags=re.S)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group(0))
+            raw_indices = parsed.get("top3_action_indices") or []
+            # Accept either the new list form or the legacy single-int form.
+            if isinstance(raw_indices, int):
+                raw_indices = [raw_indices]
+            valid_indices = [
+                int(i) for i in raw_indices
+                if isinstance(i, (int, float)) and 0 <= int(i) < num_candidates
+            ][:3]  # cap at 3, preserve order
+            result["pred_action_indices"] = valid_indices
+            if not valid_indices:
+                result["parse_error"] = f"top3_action_indices {raw_indices!r} contained no valid indices in [0, {num_candidates})"
+            atype = parsed.get("action_type")
+            result["action_type"] = str(atype).upper() if atype else None
+            result["target_element"] = parsed.get("target_element") or None
+            result["reasoning"] = parsed.get("reasoning") or None
+            return result
+        except json.JSONDecodeError as exc:
+            result["parse_error"] = f"JSON decode error: {exc}"
 
-    all_ints = re.findall(r"-?\d+", raw_output)
-    if not all_ints:
-        return None
-
-    value = int(all_ints[-1])
-    return value if 0 <= value < num_candidates else None
+    # --- 2. Regex fallback ---
+    # Scrape all integers that fall in range; treat them as an implicit ranked list.
+    all_ints = [int(m) for m in re.findall(r"-?\d+", raw_output)]
+    valid = list(dict.fromkeys(v for v in all_ints if 0 <= v < num_candidates))[:3]
+    if valid:
+        result["pred_action_indices"] = valid
+        result["parse_error"] = (result["parse_error"] or "") + " (used regex fallback)"
+    else:
+        result["parse_error"] = (result["parse_error"] or "") + " (no valid index found)"
+    return result
 
 
 def extract_operation(action_repr: str) -> Optional[str]:
@@ -350,6 +524,34 @@ def pil_to_pixel_values(image: Image.Image, dtype: torch.dtype) -> torch.Tensor:
     return transform(image.convert("RGB")).unsqueeze(0).to(dtype=dtype, device="cuda")
 
 
+def build_json_prefix_fn(
+    tokenizer: Any,
+    use_cot: bool,
+) -> Optional[Any]:
+    """Return a prefix_allowed_tokens_fn for lm-format-enforcer, or None.
+
+    When injected into generation_config, transformers' generate() calls this
+    function at every decoding step to mask tokens that would violate the
+    JSON schema — making invalid JSON structurally impossible to emit.
+
+    Works by passing the fn as ``prefix_allowed_tokens_fn`` in the dict that
+    InternVL2's chat() unpacks into model.generate(**generation_config).
+    """
+    if not _LM_FORMAT_ENFORCER_AVAILABLE:
+        import warnings
+        warnings.warn(
+            "--json_constrained requested but lm-format-enforcer is not installed. "
+            "Falling back to unconstrained decoding. "
+            "Install with: pip install lm-format-enforcer pydantic",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    schema = _SCHEMA_COT if use_cot else _SCHEMA_NO_COT
+    parser = JsonSchemaParser(schema)
+    return build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
+
+
 def run_intern_chat(
     model: Any,
     tokenizer: Any,
@@ -376,26 +578,43 @@ def make_prediction_record(
     row: Dict[str, Any],
     split: str,
     baseline_name: str,
-    pred_idx: Optional[int],
+    parsed: Dict[str, Any],
     raw_output: str,
 ) -> Dict[str, Any]:
     candidates = row.get("action_reprs", [])
     gt_idx = int(row.get("target_action_index", -1))
-    pred_action_repr = candidates[pred_idx] if pred_idx is not None and 0 <= pred_idx < len(candidates) else None
+    pred_indices: List[int] = parsed.get("pred_action_indices") or []
+    pred_idx = pred_indices[0] if pred_indices else None  # top-1
+    pred_action_repr = (
+        candidates[pred_idx]
+        if pred_idx is not None and 0 <= pred_idx < len(candidates)
+        else None
+    )
+    # Use the action_type the model explicitly named when available;
+    # fall back to extracting it from the candidate repr string.
+    pred_action = parsed.get("action_type") or extract_operation(pred_action_repr or "")
 
     return {
+        # ── identifiers ──────────────────────────────────────────────────────
         "split": split,
         "baseline": baseline_name,
         "annotation_id": row.get("annotation_id"),
         "action_uid": row.get("action_uid"),
+        # ── ground truth ─────────────────────────────────────────────────────
         "gt_action_index": gt_idx,
-        "pred_action_index": pred_idx,
         "gt_action": normalize_gt_operation(row.get("operation")),
-        "pred_action": extract_operation(pred_action_repr or ""),
         "gt_action_repr": row.get("target_action_reprs"),
+        # ── model prediction ─────────────────────────────────────────────────
+        "pred_action_index": pred_idx,            # top-1 for ElemAcc / StepAcc
+        "pred_action_indices": pred_indices,      # ranked list for Top3Elem / MRR
+        "pred_action": pred_action,
         "pred_action_repr": pred_action_repr,
+        "pred_target_element": parsed.get("target_element"),
+        "reasoning": parsed.get("reasoning"),
+        # ── diagnostics ──────────────────────────────────────────────────────
+        "parse_error": parsed.get("parse_error"),
         "raw_output": raw_output,
-        "candidates": list(range(len(candidates))),
+        "candidates": candidates,
     }
 
 
@@ -408,11 +627,27 @@ def run_single_baseline(
     args: argparse.Namespace,
     model_dtype: torch.dtype,
 ) -> int:
-    generation_config = {
-        "max_new_tokens": args.max_new_tokens,
-        "do_sample": args.temperature > 0,
-        "temperature": args.temperature,
+    # Use the baseline's own token budget, or the CLI override if supplied.
+    max_new_tokens = (
+        args.max_new_tokens
+        if args.max_new_tokens is not None
+        else baseline.get("max_new_tokens", 64)
+    )
+    do_sample = args.temperature > 0
+    generation_config: Dict[str, Any] = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": do_sample,
     }
+    # Only pass temperature when actually sampling — passing it during greedy
+    # decoding triggers a transformers UserWarning and is meaningless.
+    if do_sample:
+        generation_config["temperature"] = args.temperature
+    # Constrained decoding: inject the JSON-schema prefix fn so that
+    # model.generate() can only emit tokens consistent with the schema.
+    if args.json_constrained:
+        prefix_fn = build_json_prefix_fn(tokenizer, use_cot=baseline["cot"])
+        if prefix_fn is not None:
+            generation_config["prefix_allowed_tokens_fn"] = prefix_fn
 
     total_examples = len(dataset) if args.limit is None else min(args.limit, len(dataset))
     out_dir = Path(args.output_dir)
@@ -444,8 +679,8 @@ def run_single_baseline(
             with torch.inference_mode():
                 raw_output = run_intern_chat(model, tokenizer, pixel_values, prompt, generation_config)
 
-            pred_idx = parse_predicted_index(raw_output, num_candidates=len(row.get("action_reprs", [])))
-            record = make_prediction_record(row, split, baseline["name"], pred_idx, raw_output)
+            parsed = parse_model_output(raw_output, num_candidates=len(row.get("action_reprs", [])))
+            record = make_prediction_record(row, split, baseline["name"], parsed, raw_output)
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
             written += 1

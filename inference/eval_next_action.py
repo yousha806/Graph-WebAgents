@@ -60,29 +60,39 @@ def safe_load(line: str) -> Optional[Dict[str, Any]]:
 
 
 def action_index_accuracy(records: List[Dict[str, Any]]) -> float:
+    """Top-1 element accuracy: pred_action_indices[0] == gt_action_index."""
     total = 0
     correct = 0
     for row in records:
         gt_idx = row.get("gt_action_index")
-        pred_idx = row.get("pred_action_index")
-        if gt_idx is None or pred_idx is None:
+        if gt_idx is None:
             continue
         total += 1
-        if int(gt_idx) == int(pred_idx):
+        pred_indices = row.get("pred_action_indices") or []
+        # Fall back to legacy scalar field for backwards-compatibility.
+        if not pred_indices:
+            pi = row.get("pred_action_index")
+            pred_indices = [pi] if pi is not None else []
+        if pred_indices and int(pred_indices[0]) == int(gt_idx):
             correct += 1
     return correct / total if total else 0.0
 
 
 def action_label_accuracy(records: List[Dict[str, Any]]) -> float:
+    """Fraction of steps where the predicted action type matches ground truth.
+
+    Parse failures (pred_action is None) count as wrong, not skipped.
+    Only rows with a known gt_action contribute to the denominator.
+    """
     total = 0
     correct = 0
     for row in records:
         gt_action = row.get("gt_action")
-        pred_action = row.get("pred_action")
-        if gt_action is None or pred_action is None:
+        if gt_action is None:
             continue
         total += 1
-        if str(gt_action).upper() == str(pred_action).upper():
+        pred_action = row.get("pred_action")
+        if pred_action is not None and str(gt_action).upper() == str(pred_action).upper():
             correct += 1
     return correct / total if total else 0.0
 
@@ -91,45 +101,72 @@ def parse_failure_rate(records: List[Dict[str, Any]]) -> float:
     total = len(records)
     if total == 0:
         return 0.0
-    failures = sum(1 for row in records if row.get("pred_action_index") is None)
+    def _no_prediction(row: Dict[str, Any]) -> bool:
+        indices = row.get("pred_action_indices")
+        if indices is not None:
+            return len(indices) == 0
+        return row.get("pred_action_index") is None
+    failures = sum(1 for row in records if _no_prediction(row))
     return failures / total
 
 
 def top3_element_accuracy(records: List[Dict[str, Any]]) -> float:
-    """Element index exact match (Top-3 collapses to Top-1 for single-output models)."""
+    """Fraction of steps where gt_action_index appears anywhere in the top-3 ranked predictions."""
     total = 0
     correct = 0
     for row in records:
         gt_idx = row.get("gt_action_index")
-        pred_idx = row.get("pred_action_index")
-        if gt_idx is None or pred_idx is None:
+        if gt_idx is None:
             continue
         total += 1
-        if int(gt_idx) == int(pred_idx):
+        pred_indices = row.get("pred_action_indices") or []
+        # Backwards-compat: if only the scalar field is present, treat as top-1 list.
+        if not pred_indices:
+            pi = row.get("pred_action_index")
+            pred_indices = [pi] if pi is not None else []
+        if int(gt_idx) in [int(i) for i in pred_indices]:
             correct += 1
     return correct / total if total else 0.0
 
 
 def mean_reciprocal_rank(records: List[Dict[str, Any]]) -> float:
-    """MRR over steps: rank=1 if prediction correct, else worst-case rank=len(candidates)."""
+    """MRR over steps using the ranked top-3 list.
+
+    Reciprocal rank = 1 / position of gt in pred_action_indices (1-based).
+    If gt is not in the list (or list is empty), reciprocal rank = 0.
+    """
     total = 0
     rr_sum = 0.0
     for row in records:
         gt_idx = row.get("gt_action_index")
-        pred_idx = row.get("pred_action_index")
-        n = len(row.get("candidates") or [1])
         if gt_idx is None:
             continue
         total += 1
-        if pred_idx is not None and int(gt_idx) == int(pred_idx):
-            rr_sum += 1.0
-        else:
-            rr_sum += 1.0 / max(n, 1)
+        pred_indices = row.get("pred_action_indices") or []
+        if not pred_indices:
+            pi = row.get("pred_action_index")
+            pred_indices = [pi] if pi is not None else []
+        try:
+            rank = [int(i) for i in pred_indices].index(int(gt_idx)) + 1  # 1-based
+            rr_sum += 1.0 / rank
+        except ValueError:
+            pass  # gt not in list → reciprocal rank = 0
     return rr_sum / total if total else 0.0
 
 
 def task_success_rate(records: List[Dict[str, Any]]) -> float:
-    """Fraction of tasks (annotation_ids) where every step is predicted correctly."""
+    """Fraction of tasks (annotation_ids) where every step is predicted correctly.
+
+    Mind2Web schema:
+        annotation_id  — unique task identifier (one task = multiple steps)
+        action_uid     — unique step identifier within a task
+        gt_action_index — correct candidate index in action_reprs for this step
+        pred_action_indices — model's ranked predictions (top-1 used here)
+
+    A task counts as successful only if the top-1 prediction is correct for
+    ALL of its steps. Any parse failure or wrong prediction fails the whole task.
+    Step order within a task does not matter for this metric (all() is order-invariant).
+    """
     from collections import defaultdict
     tasks: Dict[str, List[bool]] = defaultdict(list)
     for row in records:
@@ -137,15 +174,20 @@ def task_success_rate(records: List[Dict[str, Any]]) -> float:
         gt_idx = row.get("gt_action_index")
         if ann_id is None or gt_idx is None:
             continue
-        pred_idx = row.get("pred_action_index")
-        tasks[ann_id].append(pred_idx is not None and int(pred_idx) == int(gt_idx))
+        # Prefer the ranked list; fall back to legacy scalar for older JSONL files.
+        pred_indices = row.get("pred_action_indices") or []
+        if not pred_indices:
+            pi = row.get("pred_action_index")
+            pred_indices = [pi] if pi is not None else []
+        top1_correct = bool(pred_indices) and int(pred_indices[0]) == int(gt_idx)
+        tasks[ann_id].append(top1_correct)
     if not tasks:
         return 0.0
     return sum(all(steps) for steps in tasks.values()) / len(tasks)
 
 
 def step_accuracy(records: List[Dict[str, Any]]) -> float:
-    """Fraction of steps where BOTH element index AND action type are correct."""
+    """Fraction of steps where BOTH element index (top-1) AND action type are correct."""
     total = 0
     correct = 0
     for row in records:
@@ -154,9 +196,12 @@ def step_accuracy(records: List[Dict[str, Any]]) -> float:
         if gt_idx is None or gt_action is None:
             continue
         total += 1
-        pred_idx = row.get("pred_action_index")
+        pred_indices = row.get("pred_action_indices") or []
+        if not pred_indices:
+            pi = row.get("pred_action_index")
+            pred_indices = [pi] if pi is not None else []
         pred_action = row.get("pred_action")
-        elem_ok = pred_idx is not None and int(pred_idx) == int(gt_idx)
+        elem_ok = bool(pred_indices) and int(pred_indices[0]) == int(gt_idx)
         action_ok = pred_action is not None and str(gt_action).upper() == str(pred_action).upper()
         if elem_ok and action_ok:
             correct += 1
@@ -219,8 +264,9 @@ def evaluate_file(path: Path) -> Dict[str, Any]:
         "num_parsed": len(parsed),
         "json_parse_failure_rate": 1.0 - (len(parsed) / len(raw_lines)) if raw_lines else 0.0,
         "prediction_parse_failure_rate": parse_failure_rate(parsed),
+        "ElemAcc": action_index_accuracy(parsed),
         "ActionAcc": action_label_accuracy(parsed),
-        "Top3Elem": top3_element_accuracy(parsed),
+        "Top3Elem": top3_element_accuracy(parsed),  # == ElemAcc for single-prediction models
         "MRR": mean_reciprocal_rank(parsed),
         "TaskSuccess": task_success_rate(parsed),
         "StepAcc": step_accuracy(parsed),
@@ -239,6 +285,7 @@ def aggregate(metrics_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not metrics_list:
         return {
             "num_files": 0,
+            "macro_ElemAcc": 0.0,
             "macro_ActionAcc": 0.0,
             "macro_Top3Elem": 0.0,
             "macro_MRR": 0.0,
@@ -249,6 +296,7 @@ def aggregate(metrics_list: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {
         "num_files": len(metrics_list),
+        "macro_ElemAcc": mean([m["ElemAcc"] for m in metrics_list]),
         "macro_ActionAcc": mean([m["ActionAcc"] for m in metrics_list]),
         "macro_Top3Elem": mean([m["Top3Elem"] for m in metrics_list]),
         "macro_MRR": mean([m["MRR"] for m in metrics_list]),
