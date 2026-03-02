@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -114,6 +115,39 @@ def build_quantization_config(mode: str, dtype: torch.dtype) -> Optional[BitsAnd
     raise ValueError(f"Unsupported quantization mode: {mode}")
 
 
+def _patch_internvl2_meta_device_issue() -> None:
+    """Patch InternVL2's cached model code to avoid .item() on meta tensors.
+
+    InternVL2's InternVisionEncoder.__init__ calls:
+        dpr = [x.item() for x in torch.linspace(0, config.drop_path_rate, ...)]
+
+    In transformers >= 4.45, model __init__ runs inside accelerate's meta-device
+    context even when low_cpu_mem_usage=False, causing:
+        RuntimeError: Tensor.item() cannot be called on meta tensors
+
+    This patch replaces that line with pure-Python arithmetic — equivalent in
+    value, but creates no tensors, so it is safe in any device context.
+    """
+    BUGGY = (
+        "dpr = [x.item() for x in torch.linspace("
+        "0, config.drop_path_rate, config.num_hidden_layers)]"
+    )
+    FIXED = (
+        "n = config.num_hidden_layers\n"
+        "        dpr = ([0.0] + [config.drop_path_rate * i / (n - 1) for i in range(1, n)]"
+        " if n > 1 else [0.0])"
+    )
+    hf_home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+    search_dir = hf_home / "modules" / "transformers_modules"
+    if not search_dir.is_dir():
+        return
+    for fpath in search_dir.rglob("modeling_intern_vit.py"):
+        content = fpath.read_text(encoding="utf-8")
+        if BUGGY in content:
+            fpath.write_text(content.replace(BUGGY, FIXED), encoding="utf-8")
+            print(f"[patch] Applied meta-device fix to: {fpath}")
+
+
 def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
     if not torch.cuda.is_available():
         raise RuntimeError(
@@ -147,6 +181,11 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
           f"VRAM free: {torch.cuda.mem_get_info(0)[0] / 1e9:.1f} GB  |  "
           f"flash_attn={use_flash_attn}")
 
+    # Patch InternVL2's cached model code before loading so that the
+    # torch.linspace(...).item() call in InternVisionEncoder.__init__ does not
+    # crash when transformers runs __init__ inside a meta-device context.
+    _patch_internvl2_meta_device_issue()
+
     if quantization_config is not None:
         # Quantized path: bitsandbytes requires device_map.
         # Use {"": 0} (dict form, not "auto") — "auto" triggers accelerate's
@@ -161,20 +200,18 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
         }
         model = AutoModel.from_pretrained(model_name, **model_kwargs)
     else:
-        # Non-quantized path: use device_map={"": 0} to load directly to GPU.
-        # In transformers >= 4.45, low_cpu_mem_usage=False no longer prevents
-        # accelerate's meta-device init phase, so InternVL2's __init__ still
-        # crashes on .item() calls against meta tensors.
-        # device_map={"": 0} (dict, not "auto") allocates tensors directly on
-        # GPU device 0, bypassing the meta→CPU→GPU loading chain entirely.
+        # Non-quantized path: load on CPU then move to GPU.
+        # low_cpu_mem_usage=False disables accelerate's meta-device init; the
+        # _patch_internvl2_meta_device_issue() call above fixes the root cause
+        # in the model source so this also works if meta init occurs anyway.
         model = AutoModel.from_pretrained(
             model_name,
             trust_remote_code=True,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            device_map={"": 0},
+            dtype=dtype,
+            low_cpu_mem_usage=False,
             use_flash_attn=use_flash_attn,
         )
+        model = model.to("cuda")
 
     model.eval()
     print(f"Model loaded on: {next(model.parameters()).device}")
