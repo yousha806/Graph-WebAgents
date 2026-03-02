@@ -152,10 +152,14 @@ PY
 echo "GPU compute capability: $GPU_CC"
 
 # flash-attn builds from source and requires nvcc + CUDA_HOME (the compiler/headers,
-# not just the driver runtime that PyTorch ships). Detect from common EC2 install paths;
-# fall back to conda's nvidia channel if nvcc is still missing.
+# not just the driver runtime that PyTorch ships). Detect from common EC2 install paths.
+# Checks versioned paths first (cuda-12.1 matches the cu121 torch build), then the
+# generic /usr/local/cuda symlink.
 if [[ -z "${CUDA_HOME:-}" ]]; then
-  for _cuda_dir in /usr/local/cuda /usr/local/cuda-12.8 /usr/local/cuda-12 /usr/local/cuda-11.8; do
+  for _cuda_dir in \
+      /usr/local/cuda-12.1 /usr/local/cuda-12.2 /usr/local/cuda-12.3 /usr/local/cuda-12.4 \
+      /usr/local/cuda-12 /usr/local/cuda \
+      /usr/local/cuda-11.8; do
     if [[ -x "$_cuda_dir/bin/nvcc" ]]; then
       export CUDA_HOME="$_cuda_dir"
       export PATH="$CUDA_HOME/bin:$PATH"
@@ -168,8 +172,22 @@ if [[ -z "${CUDA_HOME:-}" ]]; then
   # Use pip's nvidia-cuda-nvcc-cu12 wheel instead — ToS-free and matches the cu121 torch build.
   echo "nvcc not found in standard paths — installing nvidia-cuda-nvcc-cu12 via pip..."
   pip install nvidia-cuda-nvcc-cu12 --quiet || true
-  # The wheel places nvcc under the nvidia/cuda_nvcc package directory.
-  _NVCC_BIN="$(python -c "import nvidia.cuda_nvcc; import os; print(os.path.join(os.path.dirname(nvidia.cuda_nvcc.__file__), 'bin'))" 2>/dev/null || true)"
+  # nvidia.cuda_nvcc is a namespace package (__file__ == None); use site.getsitepackages()
+  # to locate the nvcc binary directly.
+  _NVCC_BIN="$(python - 2>/dev/null <<'PY'
+import site, os
+candidates = site.getsitepackages()
+try:
+    candidates.append(site.getusersitepackages())
+except Exception:
+    pass
+for d in candidates:
+    p = os.path.join(d, "nvidia", "cuda_nvcc", "bin", "nvcc")
+    if os.path.isfile(p):
+        print(os.path.dirname(p))
+        break
+PY
+)"
   if [[ -n "$_NVCC_BIN" && -x "$_NVCC_BIN/nvcc" ]]; then
     export CUDA_HOME="$(dirname "$_NVCC_BIN")"
     export PATH="$_NVCC_BIN:$PATH"
