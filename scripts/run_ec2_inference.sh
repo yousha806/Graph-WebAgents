@@ -144,13 +144,36 @@ except Exception:
 PY
 )
 echo "GPU compute capability: $GPU_CC"
+
+# flash-attn builds from source and requires nvcc + CUDA_HOME (the compiler/headers,
+# not just the driver runtime that PyTorch ships). Detect from common EC2 install paths;
+# fall back to conda's nvidia channel if nvcc is still missing.
+if [[ -z "${CUDA_HOME:-}" ]]; then
+  for _cuda_dir in /usr/local/cuda /usr/local/cuda-12.8 /usr/local/cuda-12 /usr/local/cuda-11.8; do
+    if [[ -x "$_cuda_dir/bin/nvcc" ]]; then
+      export CUDA_HOME="$_cuda_dir"
+      export PATH="$CUDA_HOME/bin:$PATH"
+      break
+    fi
+  done
+fi
+if [[ -z "${CUDA_HOME:-}" ]]; then
+  echo "nvcc not found in standard paths — installing cuda-nvcc via conda..."
+  conda install -y -c nvidia cuda-nvcc --quiet || true
+  if command -v nvcc >/dev/null 2>&1; then
+    export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+    export PATH="$CUDA_HOME/bin:$PATH"
+  fi
+fi
+echo "CUDA_HOME: ${CUDA_HOME:-not set}"
 echo "Installing flash-attn (this takes ~10-15 min on first run)..."
 pip install flash-attn --no-build-isolation || echo "WARNING: flash-attn install failed; will use standard attention."
 
 # Needed for precompute_axtree.py
-# install-deps installs required OS-level shared libraries (libatk, libglib, etc.)
-sudo playwright install-deps chromium
-sudo playwright install chromium
+# install-deps calls apt-get internally and needs root; pass the conda PATH so
+# sudo can find the playwright binary inside the conda env.
+sudo env PATH="$PATH" playwright install-deps chromium
+playwright install chromium
 
 # Export env vars so subprocesses (heredocs, parallel workers) can read them
 export MODEL_NAME HF_CACHE_DIR HF_TOKEN
