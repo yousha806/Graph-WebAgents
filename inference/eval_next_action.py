@@ -95,6 +95,74 @@ def parse_failure_rate(records: List[Dict[str, Any]]) -> float:
     return failures / total
 
 
+def top3_element_accuracy(records: List[Dict[str, Any]]) -> float:
+    """Element index exact match (Top-3 collapses to Top-1 for single-output models)."""
+    total = 0
+    correct = 0
+    for row in records:
+        gt_idx = row.get("gt_action_index")
+        pred_idx = row.get("pred_action_index")
+        if gt_idx is None or pred_idx is None:
+            continue
+        total += 1
+        if int(gt_idx) == int(pred_idx):
+            correct += 1
+    return correct / total if total else 0.0
+
+
+def mean_reciprocal_rank(records: List[Dict[str, Any]]) -> float:
+    """MRR over steps: rank=1 if prediction correct, else worst-case rank=len(candidates)."""
+    total = 0
+    rr_sum = 0.0
+    for row in records:
+        gt_idx = row.get("gt_action_index")
+        pred_idx = row.get("pred_action_index")
+        n = len(row.get("candidates") or [1])
+        if gt_idx is None:
+            continue
+        total += 1
+        if pred_idx is not None and int(gt_idx) == int(pred_idx):
+            rr_sum += 1.0
+        else:
+            rr_sum += 1.0 / max(n, 1)
+    return rr_sum / total if total else 0.0
+
+
+def task_success_rate(records: List[Dict[str, Any]]) -> float:
+    """Fraction of tasks (annotation_ids) where every step is predicted correctly."""
+    from collections import defaultdict
+    tasks: Dict[str, List[bool]] = defaultdict(list)
+    for row in records:
+        ann_id = row.get("annotation_id")
+        gt_idx = row.get("gt_action_index")
+        if ann_id is None or gt_idx is None:
+            continue
+        pred_idx = row.get("pred_action_index")
+        tasks[ann_id].append(pred_idx is not None and int(pred_idx) == int(gt_idx))
+    if not tasks:
+        return 0.0
+    return sum(all(steps) for steps in tasks.values()) / len(tasks)
+
+
+def step_accuracy(records: List[Dict[str, Any]]) -> float:
+    """Fraction of steps where BOTH element index AND action type are correct."""
+    total = 0
+    correct = 0
+    for row in records:
+        gt_idx = row.get("gt_action_index")
+        gt_action = row.get("gt_action")
+        if gt_idx is None or gt_action is None:
+            continue
+        total += 1
+        pred_idx = row.get("pred_action_index")
+        pred_action = row.get("pred_action")
+        elem_ok = pred_idx is not None and int(pred_idx) == int(gt_idx)
+        action_ok = pred_action is not None and str(gt_action).upper() == str(pred_action).upper()
+        if elem_ok and action_ok:
+            correct += 1
+    return correct / total if total else 0.0
+
+
 def per_action_prf(records: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
     labels = set()
     for row in records:
@@ -151,8 +219,11 @@ def evaluate_file(path: Path) -> Dict[str, Any]:
         "num_parsed": len(parsed),
         "json_parse_failure_rate": 1.0 - (len(parsed) / len(raw_lines)) if raw_lines else 0.0,
         "prediction_parse_failure_rate": parse_failure_rate(parsed),
-        "action_index_accuracy": action_index_accuracy(parsed),
-        "action_label_accuracy": action_label_accuracy(parsed),
+        "ActionAcc": action_label_accuracy(parsed),
+        "Top3Elem": top3_element_accuracy(parsed),
+        "MRR": mean_reciprocal_rank(parsed),
+        "TaskSuccess": task_success_rate(parsed),
+        "StepAcc": step_accuracy(parsed),
         "per_action": per_action_prf(parsed),
         "baselines": baselines,
         "splits": splits,
@@ -168,15 +239,21 @@ def aggregate(metrics_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not metrics_list:
         return {
             "num_files": 0,
-            "macro_action_index_accuracy": 0.0,
-            "macro_action_label_accuracy": 0.0,
+            "macro_ActionAcc": 0.0,
+            "macro_Top3Elem": 0.0,
+            "macro_MRR": 0.0,
+            "macro_TaskSuccess": 0.0,
+            "macro_StepAcc": 0.0,
             "macro_prediction_parse_failure_rate": 0.0,
         }
 
     return {
         "num_files": len(metrics_list),
-        "macro_action_index_accuracy": mean([m["action_index_accuracy"] for m in metrics_list]),
-        "macro_action_label_accuracy": mean([m["action_label_accuracy"] for m in metrics_list]),
+        "macro_ActionAcc": mean([m["ActionAcc"] for m in metrics_list]),
+        "macro_Top3Elem": mean([m["Top3Elem"] for m in metrics_list]),
+        "macro_MRR": mean([m["MRR"] for m in metrics_list]),
+        "macro_TaskSuccess": mean([m["TaskSuccess"] for m in metrics_list]),
+        "macro_StepAcc": mean([m["StepAcc"] for m in metrics_list]),
         "macro_prediction_parse_failure_rate": mean([m["prediction_parse_failure_rate"] for m in metrics_list]),
     }
 

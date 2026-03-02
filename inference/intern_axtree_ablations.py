@@ -29,7 +29,7 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 
-DEFAULT_SPLITS = ["test_task", "test_website", "test_domain"]
+DEFAULT_SPLITS = ["test_website"]
 
 BASELINES = [
     {
@@ -154,14 +154,16 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
         }
         model = AutoModel.from_pretrained(model_name, **model_kwargs)
     else:
-        # Non-quantized path: omit BOTH device_map and low_cpu_mem_usage.
-        # Either flag triggers accelerate's meta-device init, which calls .item()
-        # on meta tensors inside InternVisionEncoder.__init__ and crashes.
-        # Load fully on CPU first, then move to GPU.
+        # Non-quantized path: explicitly set low_cpu_mem_usage=False.
+        # transformers >= 4.38 defaults low_cpu_mem_usage=True when accelerate is
+        # installed, which triggers meta-device init and crashes InternVisionEncoder's
+        # __init__ (.item() on torch.linspace meta tensor). We must override it.
+        # No device_map either — load fully on CPU first, then move to GPU.
         model = AutoModel.from_pretrained(
             model_name,
             trust_remote_code=True,
             dtype=dtype,
+            low_cpu_mem_usage=False,
             use_flash_attn=use_flash_attn,
         )
         model = model.to("cuda")

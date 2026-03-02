@@ -185,7 +185,7 @@ def html_to_axtree(page, html: str) -> dict:
 
 def main():
     ap = argparse.ArgumentParser(description="Precompute AXTree for Mind2Web splits")
-    ap.add_argument("--split", default="train", choices=VALID_SPLITS)
+    ap.add_argument("--split", default="test_website", choices=VALID_SPLITS)
     ap.add_argument("--data_dir", default="data/mind2web",
                     help="Directory produced by download_mind2web.py (contains one sub-dir per split)")
     ap.add_argument("--out_dir", default="data/mind2web_axtree")

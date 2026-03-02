@@ -16,43 +16,28 @@ PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
 INFERENCE_DTYPE="${INFERENCE_DTYPE:-bf16}"
 QUANTIZATION="${QUANTIZATION:-none}"
 HF_TOKEN="${HF_TOKEN:-}"
-ENABLE_S3_SYNC="${ENABLE_S3_SYNC:-1}"
-S3_PREFIX="${S3_PREFIX:-intern_axtree_ablations}"
-S3_SYNC_INTERVAL_SEC="${S3_SYNC_INTERVAL_SEC:-300}"
-S3_ACCESS_POINT_URI=""
 
 DATA_DIR="${DATA_DIR:-$PROJECT_DIR/data/mind2web}"
 AXTREE_DIR="${AXTREE_DIR:-$PROJECT_DIR/data/mind2web_axtree}"
-OUTPUT_DIR="${OUTPUT_DIR:-$HOME/outputs/intern_axtree_ablations}"
-LOG_DIR="${LOG_DIR:-$HOME/logs}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/outputs/intern_axtree_ablations}"
+LOG_DIR="${LOG_DIR:-$PROJECT_DIR/logs}"
 HF_CACHE_DIR="${HF_CACHE_DIR:-$HOME/.cache/huggingface}"
 MINICONDA_DIR="${MINICONDA_DIR:-$HOME/miniconda3}"
-AWSCLI_INSTALL_DIR="${AWSCLI_INSTALL_DIR:-$HOME/awscli-v2}"
 
-SPLITS=(test_task test_website test_domain)
+SPLITS=(test_website)
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run_ec2_inference.sh [--s3-access-point-uri <s3://...>] [--help]
+Usage: scripts/run_ec2_inference.sh [--help]
 
-Options:
-  --s3-access-point-uri   S3 access point URI for syncing logs/outputs.
-                          Example: s3://arn:aws:s3:us-east-1:123456789012:accesspoint/my-ap/mind2web-runs
-  --help, -h              Show this help text.
+Results and logs are saved locally on the EC2 instance under OUTPUT_DIR and LOG_DIR.
+Override any config variable via environment:
+  PROJECT_DIR, MODEL_NAME, OUTPUT_DIR, LOG_DIR, HF_TOKEN, INFERENCE_DTYPE, QUANTIZATION
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --s3-access-point-uri)
-      if [[ $# -lt 2 ]]; then
-        echo "Error: --s3-access-point-uri requires a value."
-        usage
-        exit 1
-      fi
-      S3_ACCESS_POINT_URI="$2"
-      shift 2
-      ;;
     --help|-h)
       usage
       exit 0
@@ -68,17 +53,6 @@ done
 # ---------- Setup ----------
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR" "$HF_CACHE_DIR"
 cd "$PROJECT_DIR"
-
-if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
-  if [[ -z "$S3_ACCESS_POINT_URI" ]]; then
-    echo "S3 sync is enabled, but --s3-access-point-uri was not provided."
-    read -r -p "Enter S3 access point URI: " S3_ACCESS_POINT_URI
-    if [[ -z "$S3_ACCESS_POINT_URI" ]]; then
-      echo "Error: S3 access point URI cannot be empty when ENABLE_S3_SYNC=1."
-      exit 1
-    fi
-  fi
-fi
 
 # Conda-only flow: install Miniconda automatically if conda is not found anywhere.
 if ! command -v conda >/dev/null 2>&1 && [[ ! -x "$MINICONDA_DIR/bin/conda" ]]; then
@@ -138,7 +112,8 @@ fi
 # ---------- Verify conda env is active and will be used for ALL python calls ----------
 ACTIVE_CONDA_ENV="$(conda info --envs | awk '/\*/ {print $1}')" 
 PYTHON_BIN="$(command -v python)"
-if [[ "$PYTHON_BIN" != "$CONDA_BASE"* && "$PYTHON_BIN" != *"/envs/"* ]]; then
+if [[ "$PYTHON_BIN" != "$CONDA_BASE"* && "$PYTHON_BIN" != *"/envs/"* && \
+      ( -z "$CONDA_ENV_PREFIX" || "$PYTHON_BIN" != "$CONDA_ENV_PREFIX"* ) ]]; then
   echo "Error: python resolved to '$PYTHON_BIN', which is outside the conda base '$CONDA_BASE'."
   echo "Conda env activation may have failed."
   exit 1
@@ -156,40 +131,8 @@ pip install \
   -r baselines/requirements.txt \
   --extra-index-url https://download.pytorch.org/whl/cu121
 
-# ---------- NVIDIA driver check ----------
-# Detect the EC2 instance family to know if a GPU is expected.
-INSTANCE_TYPE="$(curl -sf --connect-timeout 2 http://169.254.169.254/latest/meta-data/instance-type || echo "unknown")"
-echo "EC2 instance type: $INSTANCE_TYPE"
-
-IS_GPU_INSTANCE=0
-case "$INSTANCE_TYPE" in
-  g4dn.*|g5.*|g5g.*|p2.*|p3.*|p4d.*|p5.*) IS_GPU_INSTANCE=1 ;;
-esac
-
-if [[ "$IS_GPU_INSTANCE" == "1" ]]; then
-  if ! command -v nvidia-smi >/dev/null 2>&1; then
-    echo "GPU instance detected but nvidia-smi not found — installing NVIDIA drivers..."
-    sudo apt-get update -y
-    sudo apt-get install -y nvidia-utils-535 nvidia-driver-535
-    echo "NVIDIA drivers installed. A reboot is required."
-    echo "Please run: sudo reboot"
-    echo "Then re-run this script after reconnecting."
-    exit 1
-  fi
-  echo "GPU: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
-elif [[ "$IS_GPU_INSTANCE" == "0" && "$INSTANCE_TYPE" != "unknown" ]]; then
-  echo "ERROR: Instance type '$INSTANCE_TYPE' has no GPU."
-  echo "InternVL2-8B requires a GPU instance. Stop this instance and switch to:"
-  echo "  g4dn.xlarge  (T4,  16GB VRAM) — cheapest option"
-  echo "  g5.xlarge    (A10G, 24GB VRAM) — supports Flash Attention 2"
-  echo "  p3.2xlarge   (V100, 16GB VRAM)"
-  exit 1
-fi
-
 # Flash Attention 2: must be installed AFTER torch, with --no-build-isolation so the
 # build system finds the already-installed torch and CUDA headers.
-# Only useful on Ampere+ GPUs (compute >= 8.0: A10G, A100, H100).
-# Skipped automatically on older GPUs (T4=7.5) — the model falls back to standard attention.
 GPU_CC=$(python - <<'PY'
 import subprocess, sys
 try:
@@ -201,37 +144,13 @@ except Exception:
 PY
 )
 echo "GPU compute capability: $GPU_CC"
-if python -c "import sys; cc=tuple(int(x) for x in '${GPU_CC}'.split('.')); sys.exit(0 if cc>=(8,0) else 1)" 2>/dev/null; then
-  echo "Ampere+ GPU detected — installing flash-attn (this takes ~10-15 min on first run)..."
-  pip install flash-attn --no-build-isolation || echo "WARNING: flash-attn install failed; will use standard attention."
-else
-  echo "GPU compute < 8.0 — skipping flash-attn (not supported on this GPU)."
-fi
-
-if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
-  if ! command -v aws >/dev/null 2>&1; then
-    echo "aws CLI v2 not found; installing from official AWS installer..."
-    if command -v apt-get >/dev/null 2>&1; then
-      sudo apt-get update -y || true
-      sudo apt-get install -y unzip curl || true
-    fi
-    curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
-    unzip -q /tmp/awscliv2.zip -d /tmp/awscliv2
-    sudo /tmp/awscliv2/aws/install --install-dir "$AWSCLI_INSTALL_DIR" --bin-dir /usr/local/bin
-    rm -rf /tmp/awscliv2 /tmp/awscliv2.zip
-  fi
-
-  if ! command -v aws >/dev/null 2>&1; then
-    echo "Error: aws CLI v2 installation failed."
-    exit 1
-  fi
-  echo "Using: $(aws --version)"
-fi
+echo "Installing flash-attn (this takes ~10-15 min on first run)..."
+pip install flash-attn --no-build-isolation || echo "WARNING: flash-attn install failed; will use standard attention."
 
 # Needed for precompute_axtree.py
 # install-deps installs required OS-level shared libraries (libatk, libglib, etc.)
-playwright install-deps chromium
-playwright install chromium
+sudo playwright install-deps chromium
+sudo playwright install chromium
 
 # Export env vars so subprocesses (heredocs, parallel workers) can read them
 export MODEL_NAME HF_CACHE_DIR HF_TOKEN
@@ -257,18 +176,6 @@ local_path = snapshot_download(
 )
 print(f"Model cached at: {local_path}")
 PY
-
-sync_to_s3() {
-  if [[ "$ENABLE_S3_SYNC" != "1" ]]; then
-    return 0
-  fi
-
-  local s3_base="$S3_ACCESS_POINT_URI/$S3_PREFIX"
-  echo "Syncing outputs/logs to $s3_base ..."
-
-  aws s3 sync "$OUTPUT_DIR" "$s3_base/outputs" --only-show-errors
-  aws s3 sync "$LOG_DIR" "$s3_base/logs" --only-show-errors
-}
 
 # ---------- Download ONLY test splits ----------
 # HF_DATASETS_CACHE is already exported above; no --cache_dir needed.
@@ -299,51 +206,31 @@ nohup python inference/intern_axtree_ablations.py \
 
 PID=$!
 
-if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
-  SYNC_LOG="$LOG_DIR/s3_sync_$(date +%Y%m%d_%H%M%S).log"
-  (
-    while kill -0 "$PID" >/dev/null 2>&1; do
-      sync_to_s3 || echo "[sync] WARNING: sync_to_s3 returned non-zero" >&2
-      sleep "$S3_SYNC_INTERVAL_SEC"
-    done
-
-    echo "[sync] Inference finished (PID $PID). Generating final metrics..."
-    METRICS_OUT="$OUTPUT_DIR/metrics_summary.json"
-    if ls "$OUTPUT_DIR"/preds_*.jsonl >/dev/null 2>&1; then
-      python inference/eval_next_action.py \
-        --input "$OUTPUT_DIR" \
-        --pattern "preds_*.jsonl" \
-        --out "$METRICS_OUT" \
-        && echo "[sync] Metrics written: $METRICS_OUT" \
-        || echo "[sync] WARNING: eval_next_action.py failed" >&2
-    else
-      echo "[sync] No prediction JSONL files found; skipping metrics."
-    fi
-
-    echo "[sync] Final S3 push..."
-    sync_to_s3 || echo "[sync] WARNING: final sync_to_s3 returned non-zero" >&2
-    echo "[sync] Done."
-  ) >> "$SYNC_LOG" 2>&1 &
-  SYNC_PID=$!
-fi
+# Run metrics computation after inference completes (in background, waits for inference PID)
+METRICS_LOG="$LOG_DIR/metrics_$(date +%Y%m%d_%H%M%S).log"
+(
+  while kill -0 "$PID" 2>/dev/null; do sleep 30; done
+  echo "[metrics] Inference finished. Computing metrics..."
+  METRICS_OUT="$OUTPUT_DIR/metrics_summary.json"
+  if ls "$OUTPUT_DIR"/preds_*.jsonl >/dev/null 2>&1; then
+    python inference/eval_next_action.py \
+      --input "$OUTPUT_DIR" \
+      --pattern "preds_*.jsonl" \
+      --out "$METRICS_OUT" \
+      && echo "[metrics] Written: $METRICS_OUT" \
+      || echo "[metrics] WARNING: eval_next_action.py failed" >&2
+  else
+    echo "[metrics] No prediction JSONL files found; skipping."
+  fi
+) >> "$METRICS_LOG" 2>&1 &
 
 echo "Started inference in background."
 echo "Baselines: intern_image_allinputs_axtree, intern_image_allinputs_axtree_cot"
-echo "PID: $PID"
-if [[ -n "${SYNC_PID:-}" ]]; then
-  echo "S3 sync watcher PID: $SYNC_PID"
-  echo "Sync log: $SYNC_LOG"
-fi
+echo "PID          : $PID"
 echo "Inference log: $RUN_LOG"
-echo "Outputs: $OUTPUT_DIR"
+echo "Metrics log  : $METRICS_LOG"
+echo "Outputs      : $OUTPUT_DIR"
 echo ""
 echo "Monitor with:"
 echo "  tail -f $RUN_LOG"
-if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
-  echo "  tail -f $SYNC_LOG"
-fi
 echo "  wc -l $OUTPUT_DIR/*.jsonl"
-if [[ "$ENABLE_S3_SYNC" == "1" ]]; then
-  echo "  aws s3 ls $S3_ACCESS_POINT_URI/$S3_PREFIX/outputs/"
-  echo "  aws s3 ls $S3_ACCESS_POINT_URI/$S3_PREFIX/logs/"
-fi
