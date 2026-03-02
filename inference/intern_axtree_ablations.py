@@ -264,24 +264,14 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=False)
     quantization_config = build_quantization_config(quantization, dtype)
 
-    # Flash Attention 2 gives ~2-4x speedup for long sequences by avoiding
-    # materializing the O(N^2) attention matrix in HBM. InternVL2 can produce
-    # up to 6144 image tokens (6 tiles × 1024), making FA2 highly beneficial.
-    # Requires Ampere+ GPU (compute ≥ 8.0: A10G, A100, H100).
-    # Automatically falls back to standard attention on older GPUs (T4=7.5, V100=7.0)
-    # or if flash-attn is not installed.
-    gpu_cc = torch.cuda.get_device_capability(0)
-    try:
-        import flash_attn  # noqa: F401
-        use_flash_attn = gpu_cc >= (8, 0)
-    except ImportError:
-        use_flash_attn = False
+    use_flash_attn = False  # flash-attn disabled; using standard attention
 
+    gpu_cc = torch.cuda.get_device_capability(0)
     print(f"Loading Intern model: {model_name} (quantization={quantization}, dtype={dtype})")
     print(f"GPU: {torch.cuda.get_device_name(0)}  |  "
           f"compute={gpu_cc[0]}.{gpu_cc[1]}  |  "
           f"VRAM free: {torch.cuda.mem_get_info(0)[0] / 1e9:.1f} GB  |  "
-          f"flash_attn={use_flash_attn}")
+          f"flash_attn=False")
 
     # Patch InternVL2's cached model code before loading so that the
     # torch.linspace(...).item() call in InternVisionEncoder.__init__ does not
