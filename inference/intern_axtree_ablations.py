@@ -273,8 +273,14 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
           f"VRAM free: {torch.cuda.mem_get_info(0)[0] / 1e9:.1f} GB  |  "
           f"flash_attn=False")
 
+    # Patch InternVL2's cached model file to fix the .item() on meta tensor crash.
+    # InternVisionEncoder.__init__ calls torch.linspace(...).item() which fails
+    # when transformers initialises the model on a meta device (all transformers
+    # >= 4.37 do this by default). The patch replaces it with pure-Python arithmetic.
+    _patch_internvl2_meta_device_issue()
+
     if quantization_config is not None:
-        # Quantized path: bitsandbytes requires device_map.
+
         # Use {"": 0} (dict form, not "auto") — "auto" triggers accelerate's
         # meta-device dispatch which breaks InternVL2's __init__ (.item() on linspace).
         model_kwargs: Dict[str, Any] = {
