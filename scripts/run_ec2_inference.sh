@@ -168,29 +168,19 @@ if [[ -z "${CUDA_HOME:-}" ]]; then
   done
 fi
 if [[ -z "${CUDA_HOME:-}" ]]; then
-  # conda install -c nvidia cuda-nvcc triggers Anaconda ToS in non-interactive sessions.
-  # Use pip's nvidia-cuda-nvcc-cu12 wheel instead — ToS-free and matches the cu121 torch build.
-  echo "nvcc not found in standard paths — installing nvidia-cuda-nvcc-cu12 via pip..."
-  pip install nvidia-cuda-nvcc-cu12 --quiet || true
-  # nvidia.cuda_nvcc is a namespace package (__file__ == None); use site.getsitepackages()
-  # to locate the nvcc binary directly.
-  _NVCC_BIN="$(python - 2>/dev/null <<'PY'
-import site, os
-candidates = site.getsitepackages()
-try:
-    candidates.append(site.getusersitepackages())
-except Exception:
-    pass
-for d in candidates:
-    p = os.path.join(d, "nvidia", "cuda_nvcc", "bin", "nvcc")
-    if os.path.isfile(p):
-        print(os.path.dirname(p))
-        break
-PY
-)"
-  if [[ -n "$_NVCC_BIN" && -x "$_NVCC_BIN/nvcc" ]]; then
-    export CUDA_HOME="$(dirname "$_NVCC_BIN")"
-    export PATH="$_NVCC_BIN:$PATH"
+  # Install the CUDA 12.1 compiler via apt (matches cu121 torch build).
+  # Detects Ubuntu version to select the right CUDA repo keyring URL.
+  echo "nvcc not found — installing cuda-nvcc-12-1 via apt..."
+  _UBUNTU_VER="$(. /etc/os-release && echo "${VERSION_ID//./}")"  # e.g. 2404, 2204
+  _CUDA_KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${_UBUNTU_VER}/x86_64/cuda-keyring_1.1-1_all.deb"
+  wget -q "$_CUDA_KEYRING_URL" -O /tmp/cuda-keyring.deb \
+    && sudo dpkg -i /tmp/cuda-keyring.deb \
+    && sudo apt-get update -y \
+    && sudo apt-get install -y cuda-nvcc-12-1 \
+    || echo "WARNING: apt cuda-nvcc-12-1 install failed."
+  if [[ -x "/usr/local/cuda-12.1/bin/nvcc" ]]; then
+    export CUDA_HOME="/usr/local/cuda-12.1"
+    export PATH="$CUDA_HOME/bin:$PATH"
   fi
 fi
 echo "CUDA_HOME: ${CUDA_HOME:-not set}"
