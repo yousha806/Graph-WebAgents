@@ -293,19 +293,20 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
         }
         model = AutoModel.from_pretrained(model_name, **model_kwargs)
     else:
-        # Non-quantized path: use device_map={"": 0} to load directly onto GPU.
-        # This avoids the meta-device init path in accelerate/transformers, which
-        # triggers a torch.linspace(...).item() call inside InternVisionEncoder.__init__
-        # that crashes with "Tensor.item() cannot be called on meta tensors".
-        # device_map={"": 0} (dict, not "auto") pins all layers to cuda:0 without
-        # triggering accelerate's meta-device dispatch.
+        # Non-quantized path: load to CPU, then move to GPU.
+        # Do NOT use device_map here — newer transformers (>= 4.46) runs
+        # caching_allocator_warmup() when device_map is set, which calls
+        # model.all_tied_weights_keys (missing on InternVLChatModel → AttributeError).
+        # The meta-device .item() crash in InternVisionEncoder.__init__ is handled
+        # by _patch_internvl2_meta_device_issue() called above.
         model = AutoModel.from_pretrained(
             model_name,
             trust_remote_code=True,
             torch_dtype=dtype,
-            device_map={"": 0},
+            low_cpu_mem_usage=False,
             use_flash_attn=use_flash_attn,
         )
+        model = model.to("cuda")
 
     model.eval()
     print(f"Model loaded on: {next(model.parameters()).device}")
