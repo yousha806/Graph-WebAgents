@@ -4,6 +4,7 @@
 
 ## 1. Create EC2 Instance
 
+- **Type**: `g5.2xlarge`
 - **AMI**: Ubuntu 24.04
 - **Storage**: 200 GB
 - **Security**: SSH from my IP only
