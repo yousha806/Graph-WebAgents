@@ -127,8 +127,9 @@ echo "--------------------------------------------------------------"
 python -m pip install --upgrade pip
 # Pin torch to cu121 BEFORE installing requirements so pip does not pull a newer
 # cu12x build from PyPI. cu121 requires driver >= 520; nvidia-driver-535 satisfies this.
-# Using --index-url (not --extra-index-url) forces resolution from the pytorch index only.
-pip install "torch>=2.1.0,<3.0" torchvision \
+# --force-reinstall ensures a previously-installed cu128/cu124 build is replaced.
+# --index-url (not --extra-index-url) forces resolution from the pytorch index only.
+pip install --force-reinstall "torch>=2.1.0,<3.0" torchvision \
   --index-url https://download.pytorch.org/whl/cu121
 # Install remaining deps; torch is already satisfied so it will not be reinstalled.
 pip install \
@@ -163,11 +164,15 @@ if [[ -z "${CUDA_HOME:-}" ]]; then
   done
 fi
 if [[ -z "${CUDA_HOME:-}" ]]; then
-  echo "nvcc not found in standard paths — installing cuda-nvcc via conda..."
-  conda install -y -c nvidia cuda-nvcc --quiet || true
-  if command -v nvcc >/dev/null 2>&1; then
-    export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
-    export PATH="$CUDA_HOME/bin:$PATH"
+  # conda install -c nvidia cuda-nvcc triggers Anaconda ToS in non-interactive sessions.
+  # Use pip's nvidia-cuda-nvcc-cu12 wheel instead — ToS-free and matches the cu121 torch build.
+  echo "nvcc not found in standard paths — installing nvidia-cuda-nvcc-cu12 via pip..."
+  pip install nvidia-cuda-nvcc-cu12 --quiet || true
+  # The wheel places nvcc under the nvidia/cuda_nvcc package directory.
+  _NVCC_BIN="$(python -c "import nvidia.cuda_nvcc; import os; print(os.path.join(os.path.dirname(nvidia.cuda_nvcc.__file__), 'bin'))" 2>/dev/null || true)"
+  if [[ -n "$_NVCC_BIN" && -x "$_NVCC_BIN/nvcc" ]]; then
+    export CUDA_HOME="$(dirname "$_NVCC_BIN")"
+    export PATH="$_NVCC_BIN:$PATH"
   fi
 fi
 echo "CUDA_HOME: ${CUDA_HOME:-not set}"
