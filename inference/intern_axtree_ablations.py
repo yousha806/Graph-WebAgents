@@ -105,8 +105,11 @@ BASELINES = [
     {
         "name": "intern_image_allinputs_axtree",
         "cot": False,
-        # Non-CoT output is a single integer (e.g. "3") — 32 tokens is generous.
-        "max_new_tokens": 32,
+        # The model emits a JSON object with top3_action_indices, action_type, and
+        # target_element.  Even without CoT the object can be ~50-80 tokens, so
+        # 32 was too tight and caused systematic truncation inside target_element.
+        # 256 gives comfortable headroom for the full object at all candidate counts.
+        "max_new_tokens": 256,
     },
     {
         "name": "intern_image_allinputs_axtree_cot",
@@ -461,25 +464,47 @@ def parse_model_output(raw_output: str, num_candidates: int) -> Dict[str, Any]:
         except json.JSONDecodeError as exc:
             result["parse_error"] = f"JSON decode error: {exc}"
 
-    # --- 2. Regex fallback ---
-    # Scrape all integers that fall in range; treat them as an implicit ranked list.
-    all_ints = [int(m) for m in re.findall(r"-?\d+", raw_output)]
-    valid = list(dict.fromkeys(v for v in all_ints if 0 <= v < num_candidates))[:3]
-    if valid:
+    # --- 2. Partial-JSON / targeted-regex fallback ---
+    # The model sometimes truncates the JSON mid-string (e.g. cuts off inside
+    # "target_element": "..."). Standard JSON parse fails, but the keys we care
+    # about (top3_action_indices, action_type) often appear BEFORE the truncation
+    # point. Use targeted key-value regexes rather than scanning all integers so
+    # that irrelevant numbers in the text don't pollute the ranked list.
+
+    # 2a. Try to recover top3_action_indices from a partial match on the key.
+    idx_match = re.search(r'"top3_action_indices"\s*:\s*\[([^\]]+)\]', raw_output)
+    if idx_match:
+        raw_list = idx_match.group(1)
+        all_ints = [int(m) for m in re.findall(r"-?\d+", raw_list)]
+        valid = list(dict.fromkeys(v for v in all_ints if 0 <= v < num_candidates))[:3]
         result["pred_action_indices"] = valid
-        result["parse_error"] = (result["parse_error"] or "") + " (used regex fallback)"
+        if not valid:
+            result["parse_error"] = (result["parse_error"] or "") + " (partial-JSON: indices out of range)"
+        else:
+            result["parse_error"] = (result["parse_error"] or "") + " (used partial-JSON fallback)"
     else:
-        result["parse_error"] = (result["parse_error"] or "") + " (no valid index found)"
-    # Even when JSON parsing failed, try to recover action_type from the raw text
-    # so that ActionAcc is not trivially 0 for all regex-fallback rows.
-    if result["action_type"] is None:
-        action_match = re.search(
-            r"\b(CLICK|TYPE|SELECT(?:_OPTION)?|HOVER|SCROLL|PRESS|ENTER)\b",
-            raw_output,
-            re.I,
+        # Last-resort: scrape all integers from the whole output.
+        all_ints = [int(m) for m in re.findall(r"-?\d+", raw_output)]
+        valid = list(dict.fromkeys(v for v in all_ints if 0 <= v < num_candidates))[:3]
+        result["pred_action_indices"] = valid
+        result["parse_error"] = (result["parse_error"] or "") + (
+            " (used regex fallback)" if valid else " (no valid index found)"
         )
-        if action_match:
-            result["action_type"] = action_match.group(1).upper()
+
+    # 2b. Try to recover action_type from the key-value pair in the partial text.
+    #     This is far more reliable than matching bare words anywhere in the output.
+    if result["action_type"] is None:
+        atype_match = re.search(r'"action_type"\s*:\s*"([^"]+)"', raw_output, re.I)
+        if atype_match:
+            result["action_type"] = atype_match.group(1).strip().upper()
+        else:
+            # Truly last-resort bare-word scan for known action verbs.
+            bare_match = re.search(
+                r'\b(CLICK|TYPE|SELECT(?:_OPTION)?|HOVER|SCROLL|PRESS|ENTER)\b',
+                raw_output, re.I,
+            )
+            if bare_match:
+                result["action_type"] = bare_match.group(1).upper()
     return result
 
 

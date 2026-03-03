@@ -61,6 +61,63 @@ def safe_load(line: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+import re as _re
+
+
+def _recover_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a patched copy of a prediction record for legacy JSONL files.
+
+    Two problems can exist in older outputs:
+    1. pred_action is None even though raw_output contains "action_type": "CLICK"
+       — JSON parse failed (truncated output), old code left action_type=None.
+    2. pred_action_indices stored in the record don't match what raw_output
+       actually contains — caused by an earlier ordering bug in the regex fallback.
+
+    We re-derive both fields from raw_output using the same targeted-regex
+    approach now used by parse_model_output, so eval is consistent with what
+    new inference runs would produce.  The original row dict is never mutated.
+    """
+    raw = row.get("raw_output") or ""
+    num_candidates = len(row.get("candidates") or [])
+    if not raw or num_candidates == 0:
+        return row
+
+    patched: Dict[str, Any] = {}
+
+    # --- re-derive pred_action_indices from raw_output ---
+    # Only patch when the stored list looks wrong (differs from raw_output parse).
+    idx_match = _re.search(r'"top3_action_indices"\s*:\s*\[([^\]]+)\]', raw)
+    if idx_match:
+        raw_list = idx_match.group(1)
+        all_ints = [int(m) for m in _re.findall(r"-?\d+", raw_list)]
+        valid = list(dict.fromkeys(v for v in all_ints if 0 <= v < num_candidates))[:3]
+        stored = row.get("pred_action_indices") or []
+        if valid and valid != list(stored):
+            patched["pred_action_indices"] = valid
+            patched["pred_action_index"] = valid[0]
+            # Re-derive pred_action_repr from the corrected top-1 index.
+            candidates = row.get("candidates") or []
+            if 0 <= valid[0] < len(candidates):
+                patched["pred_action_repr"] = candidates[valid[0]]
+
+    # --- re-derive pred_action when it is None but raw_output has "action_type" ---
+    if row.get("pred_action") is None:
+        atype_match = _re.search(r'"action_type"\s*:\s*"([^"]+)"', raw, _re.I)
+        if atype_match:
+            patched["pred_action"] = atype_match.group(1).strip().upper()
+        else:
+            bare = _re.search(
+                r'\b(CLICK|TYPE|SELECT(?:_OPTION)?|HOVER|SCROLL|PRESS|ENTER)\b',
+                raw, _re.I,
+            )
+            if bare:
+                patched["pred_action"] = bare.group(1).upper()
+
+    if not patched:
+        return row
+    return {**row, **patched}
+
+
 def _resolve_gt_action(value: Any) -> Optional[str]:
     """Return a plain uppercase action verb from a gt_action field.
 
@@ -324,6 +381,10 @@ def evaluate_file(path: Path) -> Dict[str, Any]:
             item = safe_load(line)
             if item is not None:
                 parsed.append(item)
+
+    # Patch records whose pred_action / pred_action_indices were truncated or
+    # mis-ordered in an older inference run (re-derived from raw_output).
+    parsed = [_recover_row(r) for r in parsed]
 
     baselines = sorted({row.get("baseline") for row in parsed if row.get("baseline")})
     splits = sorted({row.get("split") for row in parsed if row.get("split")})
