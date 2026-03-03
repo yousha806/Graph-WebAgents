@@ -369,25 +369,29 @@ def candidate_lines(action_reprs: List[str]) -> str:
 
 # JSON schema the model is asked to emit, templated per baseline type.
 _JSON_SCHEMA_NO_COT = '''\
-Respond with a single JSON object and nothing else.
+Respond with a single JSON object and nothing else. Do NOT include any text outside the JSON.
+Choose the candidate index that best matches the next action for the given task.
 Rank your top-3 best candidate indices from most to least confident.
 If only one candidate clearly matches, you may list fewer.
+IMPORTANT: all JSON values must be properly quoted strings or arrays of integers.
 {
-  "top3_action_indices": [<best index>, <2nd best>, <3rd best>],
-  "action_type": <action verb for the best candidate, e.g. "CLICK", "TYPE", "SELECT">,
-  "target_element": <brief description of the element being acted on>
+  "top3_action_indices": [<integer: best index>, <integer: 2nd best>, <integer: 3rd best>],
+  "action_type": "<action verb for the best candidate: CLICK, TYPE, SELECT, HOVER, SCROLL>",
+  "target_element": "<brief description of the element being acted on>"
 }'''
 
 _JSON_SCHEMA_COT = '''\
-Respond with a single JSON object and nothing else.
+Respond with a single JSON object and nothing else. Do NOT include any text outside the JSON.
 "reasoning" must appear first so you can think before committing to indices.
+Choose the candidate index that best matches the next action for the given task.
 Rank your top-3 best candidate indices from most to least confident.
 If only one candidate clearly matches, you may list fewer.
+IMPORTANT: all JSON values must be properly quoted strings or arrays of integers.
 {
-  "reasoning": <step-by-step explanation of which candidates match the task>,
-  "top3_action_indices": [<best index>, <2nd best>, <3rd best>],
-  "action_type": <action verb for the best candidate, e.g. "CLICK", "TYPE", "SELECT">,
-  "target_element": <brief description of the element being acted on>
+  "reasoning": "<step-by-step explanation of which candidates match the task>",
+  "top3_action_indices": [<integer: best index>, <integer: 2nd best>, <integer: 3rd best>],
+  "action_type": "<action verb for the best candidate: CLICK, TYPE, SELECT, HOVER, SCROLL>",
+  "target_element": "<brief description of the element being acted on>"
 }'''
 
 

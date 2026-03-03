@@ -104,17 +104,49 @@ def _recover_row(row: Dict[str, Any]) -> Dict[str, Any]:
     # The pattern stops at the first closing quote after the value, which is
     # correct for both complete JSON and truncated-mid-target_element outputs.
     if row.get("pred_action") is None:
+        recovered_action: Optional[str] = None
+
+        # 1. Targeted key-value regex on raw_output (most reliable).
         atype_match = re.search(r'"action_type"\s*:\s*"([A-Za-z_]+)"', raw)
         if atype_match:
-            patched["pred_action"] = atype_match.group(1).strip().upper()
-        else:
-            # Bare-word scan as last resort.
+            recovered_action = atype_match.group(1).strip().upper()
+
+        # 2. Extract from stored pred_action_repr (e.g. "[span]  Reggae -> CLICK").
+        if recovered_action is None:
+            repr_str = (
+                patched.get("pred_action_repr")
+                or row.get("pred_action_repr")
+                or ""
+            )
+            if repr_str:
+                m = re.search(r"->\s*([A-Za-z_]+)", repr_str)
+                if m:
+                    recovered_action = m.group(1).strip().upper()
+
+        # 3. Extract from candidates[pred_action_index] — always available.
+        if recovered_action is None:
+            candidates = row.get("candidates") or []
+            top1_idx = (
+                patched.get("pred_action_index")
+                if "pred_action_index" in patched
+                else row.get("pred_action_index")
+            )
+            if top1_idx is not None and 0 <= int(top1_idx) < len(candidates):
+                m = re.search(r"->\s*([A-Za-z_]+)", candidates[int(top1_idx)])
+                if m:
+                    recovered_action = m.group(1).strip().upper()
+
+        # 4. Bare-word scan as absolute last resort.
+        if recovered_action is None:
             bare = re.search(
                 r'\b(CLICK|TYPE|SELECT(?:_OPTION)?|HOVER|SCROLL|PRESS|ENTER)\b',
                 raw, re.I,
             )
             if bare:
-                patched["pred_action"] = bare.group(1).upper()
+                recovered_action = bare.group(1).upper()
+
+        if recovered_action is not None:
+            patched["pred_action"] = recovered_action
 
     if not patched:
         return row
