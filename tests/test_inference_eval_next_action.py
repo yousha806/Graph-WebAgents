@@ -436,6 +436,24 @@ class TestEvaluateFile(unittest.TestCase):
             self.assertAlmostEqual(m["ElemAcc"], 1.0)
             self.assertAlmostEqual(m["Top3Elem"], 1.0)
 
+    def test_gt_action_as_mind2web_json_string(self):
+        """gt_action stored as the raw Mind2Web JSON string is correctly resolved."""
+        # This matches the actual output before normalize_gt_operation was fixed —
+        # HuggingFace serialises operation dicts as JSON strings, so gt_action ends
+        # up as '{"ORIGINAL_OP": "CLICK", "VALUE": "", "OP": "CLICK"}' instead of
+        # 'CLICK'. ActionAcc and StepAcc must still be > 0 in this case.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_jsonl(tmp, [{
+                "annotation_id": "a",
+                "gt_action_index": 2,
+                "pred_action_indices": [2, 1, 0],
+                "gt_action": '{"ORIGINAL_OP": "CLICK", "VALUE": "", "OP": "CLICK"}',
+                "pred_action": "CLICK",
+            }])
+            m = eval_next_action.evaluate_file(path)
+            self.assertAlmostEqual(m["ActionAcc"], 1.0)
+            self.assertAlmostEqual(m["StepAcc"], 1.0)
+
 
 # ---------------------------------------------------------------------------
 # aggregate

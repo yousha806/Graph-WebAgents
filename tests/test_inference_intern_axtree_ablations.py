@@ -266,6 +266,32 @@ class TestNormalizeGtOperation(unittest.TestCase):
     def test_empty_string(self):
         self.assertIsNone(intern.normalize_gt_operation(""))
 
+    # Mind2Web-specific: uppercase "OP" / "ORIGINAL_OP" keys
+    def test_dict_uppercase_OP_key(self):
+        """Mind2Web stores operation as {"OP": "CLICK", "ORIGINAL_OP": "CLICK", "VALUE": ""}."""
+        self.assertEqual(
+            intern.normalize_gt_operation({"OP": "CLICK", "ORIGINAL_OP": "CLICK", "VALUE": ""}),
+            "CLICK",
+        )
+
+    def test_dict_uppercase_ORIGINAL_OP_only(self):
+        self.assertEqual(
+            intern.normalize_gt_operation({"ORIGINAL_OP": "TYPE", "VALUE": "hello"}),
+            "TYPE",
+        )
+
+    def test_json_string_with_OP_key(self):
+        """HuggingFace sometimes serialises the operation dict to a JSON string."""
+        raw = '{"ORIGINAL_OP": "CLICK", "VALUE": "", "OP": "CLICK"}'
+        self.assertEqual(intern.normalize_gt_operation(raw), "CLICK")
+
+    def test_json_string_type_action(self):
+        raw = '{"OP": "TYPE", "ORIGINAL_OP": "TYPE", "VALUE": "BCD Studio"}'
+        self.assertEqual(intern.normalize_gt_operation(raw), "TYPE")
+
+    def test_json_string_invalid_returns_none(self):
+        self.assertIsNone(intern.normalize_gt_operation('{"UNKNOWN_KEY": "CLICK"}'))
+
 
 # ---------------------------------------------------------------------------
 # to_pil_image

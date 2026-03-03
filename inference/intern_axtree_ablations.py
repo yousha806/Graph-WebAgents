@@ -470,6 +470,16 @@ def parse_model_output(raw_output: str, num_candidates: int) -> Dict[str, Any]:
         result["parse_error"] = (result["parse_error"] or "") + " (used regex fallback)"
     else:
         result["parse_error"] = (result["parse_error"] or "") + " (no valid index found)"
+    # Even when JSON parsing failed, try to recover action_type from the raw text
+    # so that ActionAcc is not trivially 0 for all regex-fallback rows.
+    if result["action_type"] is None:
+        action_match = re.search(
+            r"\b(CLICK|TYPE|SELECT(?:_OPTION)?|HOVER|SCROLL|PRESS|ENTER)\b",
+            raw_output,
+            re.I,
+        )
+        if action_match:
+            result["action_type"] = action_match.group(1).upper()
     return result
 
 
@@ -483,14 +493,41 @@ def extract_operation(action_repr: str) -> Optional[str]:
 
 
 def normalize_gt_operation(operation_field: Any) -> Optional[str]:
+    """Extract and normalise the action verb from the Mind2Web operation field.
+
+    The ``operation`` column in Multimodal-Mind2Web can arrive in several forms
+    depending on how the dataset was downloaded / cached:
+
+    * A dict   : {"OP": "CLICK", "ORIGINAL_OP": "CLICK", "VALUE": ""}
+    * A JSON string of the above (HF sometimes serialises nested dicts to str)
+    * A plain string like "CLICK" (legacy / re-serialised rows)
+
+    Mind2Web uses UPPERCASE keys ("OP", "ORIGINAL_OP") — the original code only
+    checked lowercase keys, so it always fell through to ``return None``, leaving
+    ``gt_action=None`` for every row and making ActionAcc / StepAcc trivially 0.
+    """
     if operation_field is None:
         return None
 
+    # If the dataset serialised the dict to a JSON string, parse it first.
     if isinstance(operation_field, str):
-        return operation_field.strip().upper() if operation_field.strip() else None
+        stripped = operation_field.strip()
+        if not stripped:
+            return None
+        if stripped.startswith("{"):
+            try:
+                operation_field = json.loads(stripped)
+                # Fall through to the dict branch below.
+            except json.JSONDecodeError:
+                # Not valid JSON — treat as a bare action string.
+                return stripped.upper()
+        else:
+            # Plain action string like "CLICK".
+            return stripped.upper()
 
     if isinstance(operation_field, dict):
-        for key in ("op", "operation", "action", "type", "name"):
+        # Check both the uppercase Mind2Web keys and common lowercase aliases.
+        for key in ("OP", "ORIGINAL_OP", "op", "operation", "action", "type", "name"):
             value = operation_field.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip().upper()
