@@ -29,6 +29,7 @@ import argparse
 import glob
 import json
 import logging
+import re
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -61,9 +62,6 @@ def safe_load(line: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-import re as _re
-
-
 def _recover_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """Return a patched copy of a prediction record for legacy JSONL files.
 
@@ -86,10 +84,10 @@ def _recover_row(row: Dict[str, Any]) -> Dict[str, Any]:
 
     # --- re-derive pred_action_indices from raw_output ---
     # Only patch when the stored list looks wrong (differs from raw_output parse).
-    idx_match = _re.search(r'"top3_action_indices"\s*:\s*\[([^\]]+)\]', raw)
+    idx_match = re.search(r'"top3_action_indices"\s*:\s*\[([^\]]+)\]', raw)
     if idx_match:
         raw_list = idx_match.group(1)
-        all_ints = [int(m) for m in _re.findall(r"-?\d+", raw_list)]
+        all_ints = [int(m) for m in re.findall(r"-?\d+", raw_list)]
         valid = list(dict.fromkeys(v for v in all_ints if 0 <= v < num_candidates))[:3]
         stored = row.get("pred_action_indices") or []
         if valid and valid != list(stored):
@@ -101,14 +99,19 @@ def _recover_row(row: Dict[str, Any]) -> Dict[str, Any]:
                 patched["pred_action_repr"] = candidates[valid[0]]
 
     # --- re-derive pred_action when it is None but raw_output has "action_type" ---
+    # Use a targeted key-value regex: match the key name explicitly so we only
+    # capture the action_type value, not stray words elsewhere in the output.
+    # The pattern stops at the first closing quote after the value, which is
+    # correct for both complete JSON and truncated-mid-target_element outputs.
     if row.get("pred_action") is None:
-        atype_match = _re.search(r'"action_type"\s*:\s*"([^"]+)"', raw, _re.I)
+        atype_match = re.search(r'"action_type"\s*:\s*"([A-Za-z_]+)"', raw)
         if atype_match:
             patched["pred_action"] = atype_match.group(1).strip().upper()
         else:
-            bare = _re.search(
+            # Bare-word scan as last resort.
+            bare = re.search(
                 r'\b(CLICK|TYPE|SELECT(?:_OPTION)?|HOVER|SCROLL|PRESS|ENTER)\b',
-                raw, _re.I,
+                raw, re.I,
             )
             if bare:
                 patched["pred_action"] = bare.group(1).upper()
