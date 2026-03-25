@@ -4,7 +4,7 @@ from tqdm import tqdm
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
 from datasets import load_dataset
 
-MODEL_NAME = "Qwen/Qwen2-VL-7B-Instruct"
+MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
 MAX_PIXELS = 1024 * 28 * 28
 # 1. Setup Quantization Config for 4-bit
 bnb_config = BitsAndBytesConfig(
@@ -18,9 +18,13 @@ print("Loading model...")
 model = Qwen2VLForConditionalGeneration.from_pretrained(
     MODEL_NAME,
     quantization_config=bnb_config,
-    device_map="auto",
-    attn_implementation="sdpa"
+    device_map=None,
+    attn_implementation="sdpa",
+    low_cpu_mem_usage=False
 )
+if torch.cuda.is_available():
+        model = model.cuda()
+model.eval()
 processor = AutoProcessor.from_pretrained(MODEL_NAME)
 
 # Load dataset directly from Hugging Face
@@ -31,7 +35,7 @@ total = 0
 results = []
 for row in tqdm(dataset):
     task = row["confirmed_task"]
-    html = row["cleaned_html"][:8000]
+    html = row["cleaned_html"][:15000]
     candidates = row["action_reprs"]
     target = int(row["target_action_index"])
     
