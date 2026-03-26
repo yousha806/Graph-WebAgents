@@ -58,8 +58,9 @@ def extract_image_features(image, processor, model, verbose=False):
                 print(f"Invalid image type: {type(image)}")
             return None
         
-        # Process image
-        inputs = processor(images=image, return_tensors="pt")
+        # Process image. Newer transformers processors may require a `text` argument;
+        # pass an empty string so image-only usage still works.
+        inputs = processor(images=image, text="", return_tensors="pt")
         inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
         
         # Extract features (CLS token from last hidden state)
