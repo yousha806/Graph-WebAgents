@@ -3,6 +3,7 @@ import json
 import torch
 from PIL import Image
 from io import BytesIO
+from collections.abc import Mapping
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig
 from datasets import load_dataset
@@ -246,8 +247,8 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                 candidate_inputs = fn()
             except Exception:
                 continue
-            if isinstance(candidate_inputs, dict):
-                image_inputs = candidate_inputs
+            if isinstance(candidate_inputs, Mapping):
+                image_inputs = dict(candidate_inputs)
                 if _resolve_pixel_values(image_inputs) is not None:
                     break
 
@@ -255,8 +256,8 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         if _resolve_pixel_values(image_inputs) is None and hasattr(processor, "image_processor"):
             try:
                 direct_image_inputs = processor.image_processor(images=image, return_tensors="pt")
-                if isinstance(direct_image_inputs, dict):
-                    image_inputs = direct_image_inputs
+                if isinstance(direct_image_inputs, Mapping):
+                    image_inputs = dict(direct_image_inputs)
             except Exception:
                 pass
         
