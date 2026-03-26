@@ -226,11 +226,24 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             print(f"Generate failed ({type(e).__name__}), using forward pass fallback")
             try:
                 with torch.inference_mode():
-                    # Get logits from forward pass
-                    outputs = model(**{k: v for k, v in inputs.items() if k in ['input_ids', 'attention_mask', 'pixel_values']})
-                    logits = outputs.logits if hasattr(outputs, 'logits') else outputs[0]
-                    
+                    # Get logits from forward pass. Some InternVL chat wrappers expect
+                    # `pixel_values` as the first positional argument rather than a keyword.
+                    fallback_inputs = {k: v for k, v in inputs.items() if k in ['input_ids', 'attention_mask', 'pixel_values']}
+                    try:
+                        outputs = model(**fallback_inputs)
+                    except TypeError:
+                        # Retry by passing pixel_values positionally if available
+                        if 'pixel_values' in fallback_inputs:
+                            pv = fallback_inputs.pop('pixel_values')
+                            outputs = model(pv, **fallback_inputs)
+                        else:
+                            raise
+
+                    logits = outputs.logits if hasattr(outputs, 'logits') else (outputs[0] if isinstance(outputs, (list, tuple)) else None)
+
                     # Greedy: take argmax of last token
+                    if logits is None:
+                        raise RuntimeError('No logits available from forward pass')
                     next_token_id = logits[0, -1, :].argmax().item()
                     if tokenizer:
                         pred_text = tokenizer.decode([next_token_id], skip_special_tokens=True)
