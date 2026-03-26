@@ -43,7 +43,7 @@ def extract_action_from_text(s: str):
     return None
 
 
-def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True):
+def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True, wrong_out: str = "wrong_preds.jsonl"):
     print(f"Loading model {MODEL_NAME}...")
     
     # ---- InternVL2 workarounds ----
@@ -117,6 +117,7 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
     dataset = load_dataset("osunlp/Multimodal-Mind2Web", split=dataset_split)
     
     results = []
+    wrong_results = []
     correct = 0
     total = 0
 
@@ -126,6 +127,10 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         candidates = row.get("action_reprs") or []
         target = int(row["target_action_index"]) if row.get("target_action_index") is not None else None
         screenshot = row.get("screenshot")
+        
+        # Skip if no screenshot
+        if screenshot is None:
+            continue
 
         candidate_text = "".join([f"{i}: {c}\n" for i, c in enumerate(candidates)])
 
@@ -261,20 +266,34 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             gt_action = extract_action_from_text(candidates[target])
         gt_value = row.get("gt_value") if row.get("gt_value") is not None else None
 
-        # Build evaluator-compatible record
+        # Build evaluator-compatible record (standardized schema)
+        html_snippet = html[:200] if html else None
+        screenshot_ref = screenshot if isinstance(screenshot, str) else None
         rec = {
             "id": row.get("annotation_id") or row.get("id"),
+            "model": MODEL_NAME,
+            "split": dataset_split,
+            "input_task": task,
+            "html_snippet": html_snippet,
+            "screenshot": screenshot_ref,
+            "candidates": candidates,
+            "gt_index": target,
             "gt_element": gt_element,
             "gt_action": gt_action,
             "gt_value": gt_value,
+            "pred_text": pred_text,
+            "pred_idx": pred_idx,
             "pred_element": pred_element,
             "pred_action": pred_action,
             "pred_value": None,
-            "candidates": candidates,
             "value_states": value_states,
-            "task_success": (pred_idx == target) if (pred_idx is not None and target is not None) else None,
+            "task_success": bool(pred_idx is not None and target is not None and pred_idx == target),
         }
         results.append(rec)
+
+        # Track incorrect examples separately
+        if pred_idx is not None and target is not None and pred_idx != target:
+            wrong_results.append(rec)
 
         if pred_idx is not None and target is not None and pred_idx == target:
             correct += 1
@@ -285,6 +304,12 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
     # Save predictions JSONL
     save_jsonl(preds_out, results)
     print(f"Wrote {len(results)} prediction records to {preds_out}")
+
+    # Save incorrect predictions to separate file if requested
+    if wrong_out:
+        save_jsonl(wrong_out, wrong_results)
+        print(f"Wrote {len(wrong_results)} incorrect prediction records to {wrong_out}")
+
     if total:
         print(f"Final Accuracy: {correct / total:.2%}")
 
@@ -294,7 +319,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--split", default="test_website", help="HF dataset split name")
     p.add_argument("--preds-out", required=True, help="Path to write predictions JSONL")
+    p.add_argument("--wrong-out", default="wrong_preds.jsonl", help="Path to write incorrect predictions JSONL")
     p.add_argument("--no-states", dest="extract_states", action="store_false", help="Disable extraction of hidden-state value vectors")
     args = p.parse_args()
-    run(dataset_split=args.split, preds_out=args.preds_out, extract_states=args.extract_states)
+    run(dataset_split=args.split, preds_out=args.preds_out, extract_states=args.extract_states, wrong_out=args.wrong_out)
 
