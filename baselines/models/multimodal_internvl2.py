@@ -2,6 +2,7 @@ import argparse
 import json
 import torch
 from PIL import Image
+from io import BytesIO
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig
 from datasets import load_dataset
@@ -57,6 +58,34 @@ def _resolve_pixel_values(model_inputs: dict):
     for k, v in model_inputs.items():
         if torch.is_tensor(v) and ("pixel" in k.lower() or "image" in k.lower()):
             return v
+
+    return None
+
+
+def _to_pil_image(screenshot):
+    """Convert dataset screenshot payloads to RGB PIL image."""
+    if screenshot is None:
+        return None
+
+    if isinstance(screenshot, Image.Image):
+        return screenshot.convert("RGB")
+
+    if isinstance(screenshot, str):
+        return Image.open(screenshot).convert("RGB")
+
+    if isinstance(screenshot, dict):
+        if screenshot.get("path"):
+            return Image.open(screenshot["path"]).convert("RGB")
+        if screenshot.get("bytes"):
+            return Image.open(BytesIO(screenshot["bytes"])) .convert("RGB")
+
+    # Numpy-like arrays from decoded image columns
+    try:
+        import numpy as np
+        if isinstance(screenshot, np.ndarray):
+            return Image.fromarray(screenshot).convert("RGB")
+    except Exception:
+        pass
 
     return None
 
@@ -167,19 +196,41 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             formatted_text = text_content
         
         # Process inputs separately: image processor and tokenizer
-        try:
-            from PIL import Image as PILImage
-        except ImportError:
-            PILImage = Image
-            
-        if isinstance(screenshot, str):
-            # File path
-            image = PILImage.open(screenshot).convert("RGB")
-        elif isinstance(screenshot, Image.Image):
-            image = screenshot.convert("RGB")
-        else:
-            # Assume it's already a PIL Image
-            image = screenshot
+        image = _to_pil_image(screenshot)
+        if image is None:
+            # Preserve row count and make failure explicit in logs/preds.
+            pred_text = "0"
+            pred_idx = None
+            pred_element = None
+            pred_action = "CLICK"
+            gt_element = candidates[target] if (target is not None and 0 <= target < len(candidates)) else None
+            gt_action = extract_action_from_text(gt_element) if gt_element else None
+            gt_value = row.get("gt_value") if row.get("gt_value") is not None else None
+            rec = {
+                "id": row.get("annotation_id") or row.get("id"),
+                "model": MODEL_NAME,
+                "split": dataset_split,
+                "input_task": task,
+                "html_snippet": html[:200] if html else None,
+                "screenshot": screenshot if isinstance(screenshot, str) else None,
+                "candidates": candidates,
+                "gt_index": target,
+                "gt_element": gt_element,
+                "gt_action": gt_action,
+                "gt_value": gt_value,
+                "pred_text": pred_text,
+                "pred_idx": pred_idx,
+                "pred_element": pred_element,
+                "pred_action": pred_action,
+                "pred_value": None,
+                "value_states": None,
+                "task_success": False,
+            }
+            results.append(rec)
+            if target is not None:
+                wrong_results.append(rec)
+            total += 1
+            continue
         
         # Build image inputs robustly across processor API variants.
         image_inputs = {}
@@ -241,6 +292,18 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                 torch.manual_seed(seed)
 
             with torch.inference_mode():
+                pixel_values = _resolve_pixel_values(inputs)
+                generate_inputs = {}
+                if "input_ids" in inputs:
+                    generate_inputs["input_ids"] = inputs["input_ids"]
+                if "attention_mask" in inputs:
+                    generate_inputs["attention_mask"] = inputs["attention_mask"]
+                if pixel_values is not None:
+                    generate_inputs["pixel_values"] = pixel_values
+
+                if not generate_inputs:
+                    generate_inputs = inputs
+
                 gen_kwargs = dict(
                     max_new_tokens=max_new_tokens,
                     num_beams=num_beams,
@@ -250,7 +313,7 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                     top_k=top_k,
                     early_stopping=early_stopping,
                 )
-                output_ids = model.generate(**inputs, **gen_kwargs)
+                output_ids = model.generate(**generate_inputs, **gen_kwargs)
 
             # Decode output
             try:
