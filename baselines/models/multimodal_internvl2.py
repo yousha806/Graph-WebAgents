@@ -43,7 +43,7 @@ def extract_action_from_text(s: str):
     return None
 
 
-def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True, wrong_out: str = "wrong_preds.jsonl"):
+def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True, wrong_out: str = "wrong_preds.jsonl", num_beams: int = 4, max_new_tokens: int = 10, do_sample: bool = False, temperature: float = 1.0, top_p: float = 1.0, top_k: int = 50, early_stopping: bool = True, seed: int = None):
     print(f"Loading model {MODEL_NAME}...")
     
     # ---- InternVL2 workarounds ----
@@ -187,9 +187,22 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         # Generate prediction
         pred_text = None
         try:
+            # Optionally set RNG seed for reproducibility
+            if seed is not None:
+                torch.manual_seed(seed)
+
             with torch.inference_mode():
-                output_ids = model.generate(**inputs, max_new_tokens=10, num_beams=4, early_stopping=True)
-            
+                gen_kwargs = dict(
+                    max_new_tokens=max_new_tokens,
+                    num_beams=num_beams,
+                    do_sample=do_sample,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    early_stopping=early_stopping,
+                )
+                output_ids = model.generate(**inputs, **gen_kwargs)
+
             # Decode output
             try:
                 if 'input_ids' in inputs:
@@ -198,16 +211,16 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                     ]
                 else:
                     generated_ids = output_ids
-                    
+
                 if tokenizer:
                     pred_text = tokenizer.batch_decode(
                         generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
                     )[0]
                 else:
                     pred_text = str(output_ids[0])
-            except Exception as e:
+            except Exception:
                 pred_text = str(output_ids[-1]) if len(output_ids) > 0 else "0"
-                
+
         except (AssertionError, AttributeError, RuntimeError) as e:
             # Last resort: do forward pass + greedy decode manually
             print(f"Generate failed ({type(e).__name__}), using forward pass fallback")
@@ -316,6 +329,14 @@ if __name__ == "__main__":
     p.add_argument("--preds-out", required=True, help="Path to write predictions JSONL")
     p.add_argument("--wrong-out", default="wrong_preds.jsonl", help="Path to write incorrect predictions JSONL")
     p.add_argument("--no-states", dest="extract_states", action="store_false", help="Disable extraction of hidden-state value vectors")
+    p.add_argument("--num-beams", type=int, default=4, help="Number of beams for generation")
+    p.add_argument("--max-new-tokens", type=int, default=10, help="Max new tokens to generate")
+    p.add_argument("--do-sample", action="store_true", help="Use sampling instead of greedy/beam search")
+    p.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
+    p.add_argument("--top-p", type=float, default=1.0, help="Top-p nucleus sampling")
+    p.add_argument("--top-k", type=int, default=50, help="Top-k sampling")
+    p.add_argument("--no-early-stopping", dest="early_stopping", action="store_false", help="Disable early stopping for beam search")
+    p.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducibility")
     args = p.parse_args()
-    run(dataset_split=args.split, preds_out=args.preds_out, extract_states=args.extract_states, wrong_out=args.wrong_out)
+    run(dataset_split=args.split, preds_out=args.preds_out, extract_states=args.extract_states, wrong_out=args.wrong_out, num_beams=args.num_beams, max_new_tokens=args.max_new_tokens, do_sample=args.do_sample, temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, early_stopping=args.early_stopping, seed=args.seed)
 
