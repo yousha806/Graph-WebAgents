@@ -43,6 +43,24 @@ def extract_action_from_text(s: str):
     return None
 
 
+def _resolve_pixel_values(model_inputs: dict):
+    """Find image tensor in processor/model inputs across possible key names."""
+    if "pixel_values" in model_inputs and torch.is_tensor(model_inputs["pixel_values"]):
+        return model_inputs["pixel_values"]
+
+    # Common alternates in multimodal processors / remote-code wrappers
+    for k in ["images", "image", "vision_x", "pixel_values_videos", "pixel_values_images"]:
+        if k in model_inputs and torch.is_tensor(model_inputs[k]):
+            return model_inputs[k]
+
+    # Last resort: any tensor key containing "pixel" or "image"
+    for k, v in model_inputs.items():
+        if torch.is_tensor(v) and ("pixel" in k.lower() or "image" in k.lower()):
+            return v
+
+    return None
+
+
 def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True, wrong_out: str = "wrong_preds.jsonl", num_beams: int = 4, max_new_tokens: int = 10, do_sample: bool = False, temperature: float = 1.0, top_p: float = 1.0, top_k: int = 50, early_stopping: bool = True, seed: int = None):
     print(f"Loading model {MODEL_NAME}...")
     
@@ -226,18 +244,22 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             print(f"Generate failed ({type(e).__name__}), using forward pass fallback")
             try:
                 with torch.inference_mode():
-                    # Get logits from forward pass. Some InternVL chat wrappers expect
-                    # `pixel_values` as the first positional argument rather than a keyword.
-                    fallback_inputs = {k: v for k, v in inputs.items() if k in ['input_ids', 'attention_mask', 'pixel_values']}
+                    # Get logits from forward pass. Some wrappers use non-standard image keys
+                    # and/or require pixel_values as the first positional argument.
+                    pixel_values = _resolve_pixel_values(inputs)
+                    if pixel_values is None:
+                        raise RuntimeError(f"No image tensor found in inputs. Keys: {list(inputs.keys())}")
+
+                    fallback_inputs = {
+                        k: v
+                        for k, v in inputs.items()
+                        if k in ["input_ids", "attention_mask", "position_ids", "image_flags"]
+                    }
                     try:
-                        outputs = model(**fallback_inputs)
+                        outputs = model(pixel_values=pixel_values, **fallback_inputs)
                     except TypeError:
-                        # Retry by passing pixel_values positionally if available
-                        if 'pixel_values' in fallback_inputs:
-                            pv = fallback_inputs.pop('pixel_values')
-                            outputs = model(pv, **fallback_inputs)
-                        else:
-                            raise
+                        # Retry by passing pixel_values positionally
+                        outputs = model(pixel_values, **fallback_inputs)
 
                     logits = outputs.logits if hasattr(outputs, 'logits') else (outputs[0] if isinstance(outputs, (list, tuple)) else None)
 
