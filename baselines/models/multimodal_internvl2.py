@@ -134,26 +134,19 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
 
         candidate_text = "".join([f"{i}: {c}\n" for i, c in enumerate(candidates)])
 
-        # Build messages for InternVL2
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": screenshot},
-                    {
-                        "type": "text",
-                        "text": f"Task: {task}\nHTML: {html}\nActions:\n{candidate_text}\nSelect the correct action index. Answer with ONLY the number.",
-                    },
-                ],
-            }
-        ]
+        # Build a text-only prompt for the tokenizer (avoid passing image objects into the chat template)
+        text_content = f"Task: {task}\nHTML: {html}\nActions:\n{candidate_text}\nSelect the correct action index. Answer with ONLY the number."
+        messages = [{"role": "user", "content": text_content}]
 
-        # Apply chat template
+        # Apply chat template if available; if it fails (e.g. template expects strings), fall back to plain text
         if tokenizer:
-            formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            try:
+                formatted_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            except Exception as e:
+                print(f"Warning: apply_chat_template failed ({type(e).__name__}), falling back to plain prompt")
+                formatted_text = text_content
         else:
-            # fallback: just format text manually
-            formatted_text = f"Task: {task}\nActions:\n{candidate_text}\nSelect the correct action index. Answer with ONLY the number."
+            formatted_text = text_content
         
         # Process inputs separately: image processor and tokenizer
         try:
@@ -193,7 +186,7 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         pred_text = None
         try:
             with torch.inference_mode():
-                output_ids = model.generate(**inputs, max_new_tokens=10)
+                output_ids = model.generate(**inputs, max_new_tokens=10, num_beams=4, early_stopping=True)
             
             # Decode output
             try:
