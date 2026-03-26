@@ -181,10 +181,33 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             # Assume it's already a PIL Image
             image = screenshot
         
-        # Process image with processor. New transformers processors may require a `text` or
-        # `text_target` argument; pass an empty text string so image-only use still works
-        # and any tokenizer-based text inputs (below) will overwrite processor text fields.
-        image_inputs = processor(images=image, text="", return_tensors="pt")
+        # Build image inputs robustly across processor API variants.
+        image_inputs = {}
+        image_call_variants = [
+            lambda: processor(images=image, return_tensors="pt"),
+            lambda: processor(image, return_tensors="pt"),
+            lambda: processor(images=[image], return_tensors="pt"),
+            lambda: processor(images=image, text=None, return_tensors="pt"),
+            lambda: processor(images=image, text="", return_tensors="pt"),
+        ]
+        for fn in image_call_variants:
+            try:
+                candidate_inputs = fn()
+            except Exception:
+                continue
+            if isinstance(candidate_inputs, dict):
+                image_inputs = candidate_inputs
+                if _resolve_pixel_values(image_inputs) is not None:
+                    break
+
+        # Last resort: use processor.image_processor directly when available.
+        if _resolve_pixel_values(image_inputs) is None and hasattr(processor, "image_processor"):
+            try:
+                direct_image_inputs = processor.image_processor(images=image, return_tensors="pt")
+                if isinstance(direct_image_inputs, dict):
+                    image_inputs = direct_image_inputs
+            except Exception:
+                pass
         
         # Tokenize text only with tokenizer
         if tokenizer:
@@ -198,8 +221,16 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         else:
             text_inputs = {}
         
-        # Combine: image_inputs has pixel_values, text_inputs has input_ids, attention_mask
+        # Combine: image_inputs should include image tensors, text_inputs has token fields.
         inputs = {**image_inputs, **text_inputs}
+
+        # Ensure a canonical pixel_values key exists if we detected any image tensor key.
+        resolved_pixels = _resolve_pixel_values(inputs)
+        if resolved_pixels is None:
+            resolved_pixels = _resolve_pixel_values(image_inputs)
+        if resolved_pixels is not None and "pixel_values" not in inputs:
+            inputs["pixel_values"] = resolved_pixels
+
         inputs = {k: v.to("cuda" if torch.cuda.is_available() else "cpu") for k, v in inputs.items()}
 
         # Generate prediction
