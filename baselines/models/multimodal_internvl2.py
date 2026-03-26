@@ -91,6 +91,57 @@ def _to_pil_image(screenshot):
     return None
 
 
+def _predict_with_chat_api(model, tokenizer, image, prompt_text, gen_kwargs, device):
+    """Try InternVL-style chat APIs across common signatures."""
+    if not hasattr(model, "chat"):
+        return None
+
+    # Keep generation kwargs conservative for chat APIs.
+    chat_generation_config = {
+        "max_new_tokens": gen_kwargs.get("max_new_tokens", 10),
+        "do_sample": gen_kwargs.get("do_sample", False),
+        "temperature": gen_kwargs.get("temperature", 1.0),
+        "top_p": gen_kwargs.get("top_p", 1.0),
+        "top_k": gen_kwargs.get("top_k", 50),
+        "num_beams": gen_kwargs.get("num_beams", 1),
+    }
+
+    # Convert PIL image to tensor for chat calls that expect pixel_values directly.
+    pixel_values = None
+    try:
+        import numpy as np
+        arr = np.array(image).astype("float32") / 255.0
+        if arr.ndim == 3:
+            arr = arr.transpose(2, 0, 1)  # HWC -> CHW
+            pixel_values = torch.from_numpy(arr).unsqueeze(0).to(device)
+    except Exception:
+        pixel_values = None
+
+    attempts = [
+        lambda: model.chat(tokenizer, image, prompt_text, generation_config=chat_generation_config),
+        lambda: model.chat(tokenizer, image, prompt_text),
+        lambda: model.chat(tokenizer=tokenizer, pixel_values=pixel_values, question=prompt_text, generation_config=chat_generation_config),
+        lambda: model.chat(tokenizer=tokenizer, pixel_values=pixel_values, question=prompt_text),
+        lambda: model.chat(tokenizer=tokenizer, image=image, query=prompt_text, generation_config=chat_generation_config),
+        lambda: model.chat(tokenizer=tokenizer, image=image, query=prompt_text),
+        lambda: model.chat(tokenizer=tokenizer, query=prompt_text, image=image),
+    ]
+
+    for attempt in attempts:
+        try:
+            out = attempt()
+            if isinstance(out, tuple):
+                # Some APIs return (response, history)
+                out = out[0]
+            if out is not None:
+                out = str(out).strip()
+                if out:
+                    return out
+        except Exception:
+            continue
+    return None
+
+
 def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True, wrong_out: str = "wrong_preds.jsonl", num_beams: int = 4, max_new_tokens: int = 10, do_sample: bool = False, temperature: float = 1.0, top_p: float = 1.0, top_k: int = 50, early_stopping: bool = True, seed: int = None):
     print(f"Loading model {MODEL_NAME}...")
     
@@ -305,6 +356,15 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
 
         # Generate prediction
         pred_text = None
+        gen_kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            num_beams=num_beams,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            early_stopping=early_stopping,
+        )
         try:
             # Optionally set RNG seed for reproducibility
             if seed is not None:
@@ -320,43 +380,67 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                 if pixel_values is not None:
                     generate_inputs["pixel_values"] = pixel_values
 
-                if not generate_inputs:
-                    generate_inputs = inputs
-
-                gen_kwargs = dict(
-                    max_new_tokens=max_new_tokens,
-                    num_beams=num_beams,
-                    do_sample=do_sample,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    early_stopping=early_stopping,
-                )
-                output_ids = model.generate(**generate_inputs, **gen_kwargs)
+                # If we have no image tensor, use chat API directly.
+                if pixel_values is None:
+                    chat_pred = _predict_with_chat_api(
+                        model=model,
+                        tokenizer=tokenizer,
+                        image=image,
+                        prompt_text=text_content,
+                        gen_kwargs=gen_kwargs,
+                        device=("cuda" if torch.cuda.is_available() else "cpu"),
+                    )
+                    if chat_pred is not None:
+                        pred_text = chat_pred
+                        output_ids = None
+                    else:
+                        output_ids = model.generate(**generate_inputs, **gen_kwargs)
+                else:
+                    if not generate_inputs:
+                        generate_inputs = inputs
+                    output_ids = model.generate(**generate_inputs, **gen_kwargs)
 
             # Decode output
             try:
-                if 'input_ids' in inputs:
+                if pred_text is not None:
+                    pass
+                elif 'input_ids' in inputs and output_ids is not None:
                     generated_ids = [
                         output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs['input_ids'], output_ids)
                     ]
                 else:
                     generated_ids = output_ids
 
-                if tokenizer:
+                if pred_text is not None:
+                    pass
+                elif tokenizer:
                     pred_text = tokenizer.batch_decode(
                         generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
                     )[0]
                 else:
                     pred_text = str(output_ids[0])
             except Exception:
-                pred_text = str(output_ids[-1]) if len(output_ids) > 0 else "0"
+                if pred_text is None:
+                    pred_text = str(output_ids[-1]) if output_ids is not None and len(output_ids) > 0 else "0"
 
         except (AssertionError, AttributeError, RuntimeError) as e:
             # Last resort: do forward pass + greedy decode manually
             print(f"Generate failed ({type(e).__name__}), using forward pass fallback")
             try:
                 with torch.inference_mode():
+                    # Try chat API first in fallback path.
+                    chat_pred = _predict_with_chat_api(
+                        model=model,
+                        tokenizer=tokenizer,
+                        image=image,
+                        prompt_text=text_content,
+                        gen_kwargs=gen_kwargs,
+                        device=("cuda" if torch.cuda.is_available() else "cpu"),
+                    )
+                    if chat_pred is not None:
+                        pred_text = chat_pred
+                        raise StopIteration("chat-success")
+
                     # Get logits from forward pass. Some wrappers use non-standard image keys
                     # and/or require pixel_values as the first positional argument.
                     pixel_values = _resolve_pixel_values(inputs)
@@ -384,6 +468,8 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                         pred_text = tokenizer.decode([next_token_id], skip_special_tokens=True)
                     else:
                         pred_text = str(next_token_id)
+            except StopIteration:
+                pass
             except Exception as e2:
                 print(f"Forward pass fallback also failed: {e2}")
                 pred_text = "0"
