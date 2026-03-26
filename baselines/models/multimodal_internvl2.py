@@ -147,6 +147,63 @@ def _build_default_image_flags(pixel_values):
     return torch.ones((bsz, 1), dtype=torch.long, device=pixel_values.device)
 
 
+def _infer_num_image_tokens(model):
+    """Infer how many image context tokens InternVL expects per image."""
+    for attr in ["num_image_token", "image_token_len", "vision_token_len"]:
+        v = getattr(model, attr, None)
+        if isinstance(v, int) and v > 0:
+            return v
+    cfg = getattr(model, "config", None)
+    if cfg is not None:
+        for attr in ["num_image_token", "image_token_len", "vision_token_len"]:
+            v = getattr(cfg, attr, None)
+            if isinstance(v, int) and v > 0:
+                return v
+    # InternVL2-8B commonly uses 256 image tokens.
+    return 256
+
+
+def _ensure_image_context_tokens(inputs, model):
+    """Ensure input_ids include image context placeholders when pixel_values are present."""
+    if "pixel_values" not in inputs or "input_ids" not in inputs:
+        return inputs
+
+    img_context_id = getattr(model, "img_context_token_id", None)
+    if img_context_id is None:
+        return inputs
+
+    input_ids = inputs["input_ids"]
+    if not torch.is_tensor(input_ids) or input_ids.ndim != 2:
+        return inputs
+
+    # If any context tokens already exist, keep as-is.
+    if (input_ids == img_context_id).any().item():
+        return inputs
+
+    num_img_tokens = _infer_num_image_tokens(model)
+    bsz = input_ids.shape[0]
+    device = input_ids.device
+    dtype = input_ids.dtype
+
+    img_tokens = torch.full((bsz, num_img_tokens), int(img_context_id), dtype=dtype, device=device)
+    inputs["input_ids"] = torch.cat([img_tokens, input_ids], dim=1)
+
+    if "attention_mask" in inputs and torch.is_tensor(inputs["attention_mask"]):
+        am = inputs["attention_mask"]
+        if am.ndim == 2 and am.shape[0] == bsz:
+            am_img = torch.ones((bsz, num_img_tokens), dtype=am.dtype, device=am.device)
+            inputs["attention_mask"] = torch.cat([am_img, am], dim=1)
+
+    if "position_ids" in inputs and torch.is_tensor(inputs["position_ids"]):
+        pos = inputs["position_ids"]
+        if pos.ndim == 2 and pos.shape[0] == bsz:
+            inputs["position_ids"] = torch.arange(
+                inputs["input_ids"].shape[1], device=pos.device, dtype=pos.dtype
+            ).unsqueeze(0).repeat(bsz, 1)
+
+    return inputs
+
+
 def _predict_with_chat_api(model, tokenizer, image, prompt_text, gen_kwargs, device, manual_pixel_values=None):
     """Try InternVL-style chat APIs across common signatures."""
     if not hasattr(model, "chat"):
@@ -411,6 +468,10 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             inputs["pixel_values"] = resolved_pixels
             if "image_flags" not in inputs:
                 inputs["image_flags"] = _build_default_image_flags(resolved_pixels)
+
+        # InternVL requires image context tokens in input_ids to place vit_embeds.
+        # If tokenizer/template omitted them, inject placeholders explicitly.
+        inputs = _ensure_image_context_tokens(inputs, model)
 
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
