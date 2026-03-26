@@ -142,7 +142,7 @@ def _predict_with_chat_api(model, tokenizer, image, prompt_text, gen_kwargs, dev
     return None
 
 
-def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True, wrong_out: str = "wrong_preds.jsonl", num_beams: int = 4, max_new_tokens: int = 10, do_sample: bool = False, temperature: float = 1.0, top_p: float = 1.0, top_k: int = 50, early_stopping: bool = True, seed: int = None):
+def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True, wrong_out: str = "wrong_preds.jsonl", num_beams: int = 4, max_new_tokens: int = 10, do_sample: bool = False, temperature: float = 1.0, top_p: float = 1.0, top_k: int = 50, early_stopping: bool = True, seed: int = None, strict_vision: bool = True):
     print(f"Loading model {MODEL_NAME}...")
     
     # ---- InternVL2 workarounds ----
@@ -250,6 +250,8 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         # Process inputs separately: image processor and tokenizer
         image = _to_pil_image(screenshot)
         if image is None:
+            if strict_vision:
+                raise RuntimeError(f"Unable to decode screenshot for id={row.get('annotation_id') or row.get('id')}; aborting in strict vision mode")
             # Preserve row count and make failure explicit in logs/preds.
             pred_text = "0"
             pred_idx = None
@@ -305,8 +307,8 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                     break
 
         # Fallback path: build image + text separately when unified call doesn't produce image tensors.
+        image_inputs = {}
         if _resolve_pixel_values(inputs) is None:
-            image_inputs = {}
             image_call_variants = [
                 lambda: processor(images=image, return_tensors="pt"),
                 lambda: processor(image, return_tensors="pt"),
@@ -394,6 +396,11 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                         pred_text = chat_pred
                         output_ids = None
                     else:
+                        if strict_vision:
+                            raise RuntimeError(
+                                f"No image tensor available for generate and chat fallback failed for id={row.get('annotation_id') or row.get('id')}. "
+                                f"Input keys: {list(inputs.keys())}"
+                            )
                         output_ids = model.generate(**generate_inputs, **gen_kwargs)
                 else:
                     if not generate_inputs:
@@ -471,6 +478,10 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             except StopIteration:
                 pass
             except Exception as e2:
+                if strict_vision:
+                    raise RuntimeError(
+                        f"Forward pass fallback failed in strict vision mode for id={row.get('annotation_id') or row.get('id')}: {e2}"
+                    ) from e2
                 print(f"Forward pass fallback also failed: {e2}")
                 pred_text = "0"
 
@@ -571,6 +582,7 @@ if __name__ == "__main__":
     p.add_argument("--top-k", type=int, default=50, help="Top-k sampling")
     p.add_argument("--no-early-stopping", dest="early_stopping", action="store_false", help="Disable early stopping for beam search")
     p.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducibility")
+    p.add_argument("--allow-text-only-fallback", dest="strict_vision", action="store_false", help="Allow text-only fallback when image tensors are missing (not recommended)")
     args = p.parse_args()
-    run(dataset_split=args.split, preds_out=args.preds_out, extract_states=args.extract_states, wrong_out=args.wrong_out, num_beams=args.num_beams, max_new_tokens=args.max_new_tokens, do_sample=args.do_sample, temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, early_stopping=args.early_stopping, seed=args.seed)
+    run(dataset_split=args.split, preds_out=args.preds_out, extract_states=args.extract_states, wrong_out=args.wrong_out, num_beams=args.num_beams, max_new_tokens=args.max_new_tokens, do_sample=args.do_sample, temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, early_stopping=args.early_stopping, seed=args.seed, strict_vision=args.strict_vision)
 
