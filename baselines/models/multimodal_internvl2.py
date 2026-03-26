@@ -147,6 +147,80 @@ def _build_default_image_flags(pixel_values):
     return torch.ones((bsz, 1), dtype=torch.long, device=pixel_values.device)
 
 
+def _infer_vocab_size(model):
+    """Infer language embedding vocabulary size."""
+    try:
+        emb = model.language_model.get_input_embeddings()
+        if hasattr(emb, "num_embeddings"):
+            return int(emb.num_embeddings)
+    except Exception:
+        pass
+    cfg = getattr(model, "config", None)
+    if cfg is not None and hasattr(cfg, "vocab_size"):
+        return int(cfg.vocab_size)
+    return None
+
+
+def _resolve_safe_img_context_token_id(model, tokenizer):
+    """Resolve a valid image-context token id that is guaranteed in embedding range."""
+    vocab_size = _infer_vocab_size(model)
+
+    candidates = []
+    for src in [model, getattr(model, "config", None), tokenizer]:
+        if src is None:
+            continue
+        for attr in ["img_context_token_id", "image_token_id"]:
+            v = getattr(src, attr, None)
+            if isinstance(v, int):
+                candidates.append(v)
+
+    # Try token-name lookups from tokenizer if available.
+    if tokenizer is not None:
+        for tok in ["<IMG_CONTEXT>", "<image>", "<img>"]:
+            try:
+                tid = tokenizer.convert_tokens_to_ids(tok)
+                if isinstance(tid, int) and tid >= 0:
+                    candidates.append(tid)
+            except Exception:
+                pass
+        for attr in ["unk_token_id", "eos_token_id", "bos_token_id", "pad_token_id"]:
+            tid = getattr(tokenizer, attr, None)
+            if isinstance(tid, int) and tid >= 0:
+                candidates.append(tid)
+
+    # Last-resort candidate.
+    candidates.append(0)
+
+    def _valid(tid):
+        if not isinstance(tid, int) or tid < 0:
+            return False
+        if vocab_size is None:
+            return True
+        return tid < vocab_size
+
+    for tid in candidates:
+        if _valid(tid):
+            return int(tid)
+
+    # Absolute fallback: clamp into range when vocab is known.
+    if vocab_size is not None and vocab_size > 0:
+        return int(vocab_size - 1)
+    return 0
+
+
+def _sanitize_input_ids(inputs, vocab_size):
+    """Ensure input_ids are long and within embedding range."""
+    if vocab_size is None or "input_ids" not in inputs:
+        return inputs
+    ids = inputs["input_ids"]
+    if not torch.is_tensor(ids):
+        return inputs
+    ids = ids.to(dtype=torch.long)
+    ids = ids.clamp(min=0, max=vocab_size - 1)
+    inputs["input_ids"] = ids
+    return inputs
+
+
 def _infer_num_image_tokens(model):
     """Infer how many image context tokens InternVL expects per image."""
     for attr in ["num_image_token", "image_token_len", "vision_token_len"]:
@@ -304,20 +378,8 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         print(f"Warning: tokenizer loading failed ({e}), using minimal fallback")
         tokenizer = None
     
-    # Set InternVL2's required img_context_token_id
-    if not hasattr(model, 'img_context_token_id') or model.img_context_token_id is None:
-        # Try to get from config first
-        if hasattr(model.config, 'img_context_token_id'):
-            model.img_context_token_id = model.config.img_context_token_id
-        elif hasattr(model, 'config') and hasattr(model.config, 'image_token_id'):
-            model.img_context_token_id = model.config.image_token_id
-        else:
-            # Default fallback: use token ID 0 or find from tokenizer
-            if tokenizer and hasattr(tokenizer, 'img_context_token_id'):
-                model.img_context_token_id = tokenizer.img_context_token_id
-            else:
-                # Last resort: use a common image token ID (often in range 100-1000 for special tokens)
-                model.img_context_token_id = 151857  # Common for InternVL models
+    # Set a safe InternVL2 img_context_token_id guaranteed to be valid for embeddings.
+    model.img_context_token_id = _resolve_safe_img_context_token_id(model, tokenizer)
 
     # Load dataset from Hugging Face
     print("Loading dataset from Hugging Face...")
@@ -474,6 +536,7 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         inputs = _ensure_image_context_tokens(inputs, model)
 
         inputs = {k: v.to(device) for k, v in inputs.items()}
+        inputs = _sanitize_input_ids(inputs, _infer_vocab_size(model))
 
         # Generate prediction
         pred_text = None
@@ -630,6 +693,8 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         value_states = None
         if extract_states:
             try:
+                if "pixel_values" not in inputs:
+                    raise RuntimeError("Skipping value_states: no pixel_values in inputs")
                 with torch.inference_mode():
                     outputs = model(**inputs, output_hidden_states=True, return_dict=True)
                 if hasattr(outputs, "hidden_states") and outputs.hidden_states:
