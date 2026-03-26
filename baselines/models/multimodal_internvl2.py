@@ -91,7 +91,39 @@ def _to_pil_image(screenshot):
     return None
 
 
-def _predict_with_chat_api(model, tokenizer, image, prompt_text, gen_kwargs, device):
+def _build_manual_pixel_values(image, device):
+    """Build a basic pixel tensor fallback for InternVL-style APIs.
+
+    This is intentionally simple and robust: single 448x448 RGB crop.
+    """
+    if image is None:
+        return None
+
+    try:
+        from torchvision import transforms
+        transform = transforms.Compose([
+            transforms.Resize((448, 448), interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        ])
+        px = transform(image).unsqueeze(0)
+    except Exception:
+        # Fallback without torchvision
+        import numpy as np
+        arr = np.array(image.resize((448, 448))).astype("float32") / 255.0
+        if arr.ndim == 2:
+            arr = np.stack([arr, arr, arr], axis=-1)
+        arr = (arr - np.array([0.485, 0.456, 0.406], dtype="float32")) / np.array([0.229, 0.224, 0.225], dtype="float32")
+        arr = arr.transpose(2, 0, 1)
+        px = torch.from_numpy(arr).unsqueeze(0)
+
+    px = px.to(device)
+    if torch.cuda.is_available():
+        px = px.to(dtype=torch.float16)
+    return px
+
+
+def _predict_with_chat_api(model, tokenizer, image, prompt_text, gen_kwargs, device, manual_pixel_values=None):
     """Try InternVL-style chat APIs across common signatures."""
     if not hasattr(model, "chat"):
         return None
@@ -107,17 +139,11 @@ def _predict_with_chat_api(model, tokenizer, image, prompt_text, gen_kwargs, dev
     }
 
     # Convert PIL image to tensor for chat calls that expect pixel_values directly.
-    pixel_values = None
-    try:
-        import numpy as np
-        arr = np.array(image).astype("float32") / 255.0
-        if arr.ndim == 3:
-            arr = arr.transpose(2, 0, 1)  # HWC -> CHW
-            pixel_values = torch.from_numpy(arr).unsqueeze(0).to(device)
-    except Exception:
-        pixel_values = None
+    pixel_values = manual_pixel_values if manual_pixel_values is not None else _build_manual_pixel_values(image, device)
 
     attempts = [
+        lambda: model.chat(tokenizer, pixel_values, prompt_text, generation_config=chat_generation_config),
+        lambda: model.chat(tokenizer, pixel_values, prompt_text),
         lambda: model.chat(tokenizer, image, prompt_text, generation_config=chat_generation_config),
         lambda: model.chat(tokenizer, image, prompt_text),
         lambda: model.chat(tokenizer=tokenizer, pixel_values=pixel_values, question=prompt_text, generation_config=chat_generation_config),
@@ -249,6 +275,8 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         
         # Process inputs separately: image processor and tokenizer
         image = _to_pil_image(screenshot)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        manual_pixel_values = _build_manual_pixel_values(image, device) if image is not None else None
         if image is None:
             if strict_vision:
                 raise RuntimeError(f"Unable to decode screenshot for id={row.get('annotation_id') or row.get('id')}; aborting in strict vision mode")
@@ -351,10 +379,12 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         resolved_pixels = _resolve_pixel_values(inputs)
         if resolved_pixels is None:
             resolved_pixels = _resolve_pixel_values(image_inputs)
+        if resolved_pixels is None and manual_pixel_values is not None:
+            resolved_pixels = manual_pixel_values
         if resolved_pixels is not None and "pixel_values" not in inputs:
             inputs["pixel_values"] = resolved_pixels
 
-        inputs = {k: v.to("cuda" if torch.cuda.is_available() else "cpu") for k, v in inputs.items()}
+        inputs = {k: v.to(device) for k, v in inputs.items()}
 
         # Generate prediction
         pred_text = None
@@ -390,7 +420,8 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                         image=image,
                         prompt_text=text_content,
                         gen_kwargs=gen_kwargs,
-                        device=("cuda" if torch.cuda.is_available() else "cpu"),
+                        device=device,
+                        manual_pixel_values=manual_pixel_values,
                     )
                     if chat_pred is not None:
                         pred_text = chat_pred
@@ -442,7 +473,8 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                         image=image,
                         prompt_text=text_content,
                         gen_kwargs=gen_kwargs,
-                        device=("cuda" if torch.cuda.is_available() else "cpu"),
+                        device=device,
+                        manual_pixel_values=manual_pixel_values,
                     )
                     if chat_pred is not None:
                         pred_text = chat_pred
