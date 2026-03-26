@@ -78,7 +78,7 @@ def _to_pil_image(screenshot):
         if screenshot.get("path"):
             return Image.open(screenshot["path"]).convert("RGB")
         if screenshot.get("bytes"):
-            return Image.open(BytesIO(screenshot["bytes"])) .convert("RGB")
+            return Image.open(BytesIO(screenshot["bytes"])).convert("RGB")
 
     # Numpy-like arrays from decoded image columns
     try:
@@ -233,48 +233,66 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             total += 1
             continue
         
-        # Build image inputs robustly across processor API variants.
-        image_inputs = {}
-        image_call_variants = [
-            lambda: processor(images=image, return_tensors="pt"),
-            lambda: processor(image, return_tensors="pt"),
-            lambda: processor(images=[image], return_tensors="pt"),
-            lambda: processor(images=image, text=None, return_tensors="pt"),
-            lambda: processor(images=image, text="", return_tensors="pt"),
+        # Primary path: build multimodal inputs in one processor call.
+        # InternVL-style processors often require an <image> marker in the prompt.
+        inputs = {}
+        mm_text = f"<image>\n{formatted_text}"
+        mm_call_variants = [
+            lambda: processor(text=[mm_text], images=[image], return_tensors="pt", padding=True),
+            lambda: processor(text=mm_text, images=image, return_tensors="pt"),
+            lambda: processor(text=[mm_text], images=image, return_tensors="pt"),
+            lambda: processor(text=mm_text, images=[image], return_tensors="pt"),
         ]
-        for fn in image_call_variants:
+        for fn in mm_call_variants:
             try:
                 candidate_inputs = fn()
             except Exception:
                 continue
             if isinstance(candidate_inputs, Mapping):
-                image_inputs = dict(candidate_inputs)
-                if _resolve_pixel_values(image_inputs) is not None:
+                inputs = dict(candidate_inputs)
+                if _resolve_pixel_values(inputs) is not None:
                     break
 
-        # Last resort: use processor.image_processor directly when available.
-        if _resolve_pixel_values(image_inputs) is None and hasattr(processor, "image_processor"):
-            try:
-                direct_image_inputs = processor.image_processor(images=image, return_tensors="pt")
-                if isinstance(direct_image_inputs, Mapping):
-                    image_inputs = dict(direct_image_inputs)
-            except Exception:
-                pass
-        
-        # Tokenize text only with tokenizer
-        if tokenizer:
-            text_inputs = tokenizer(
-                formatted_text,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=2048,
-            )
-        else:
-            text_inputs = {}
-        
-        # Combine: image_inputs should include image tensors, text_inputs has token fields.
-        inputs = {**image_inputs, **text_inputs}
+        # Fallback path: build image + text separately when unified call doesn't produce image tensors.
+        if _resolve_pixel_values(inputs) is None:
+            image_inputs = {}
+            image_call_variants = [
+                lambda: processor(images=image, return_tensors="pt"),
+                lambda: processor(image, return_tensors="pt"),
+                lambda: processor(images=[image], return_tensors="pt"),
+                lambda: processor(images=image, text=None, return_tensors="pt"),
+                lambda: processor(images=image, text="", return_tensors="pt"),
+            ]
+            for fn in image_call_variants:
+                try:
+                    candidate_inputs = fn()
+                except Exception:
+                    continue
+                if isinstance(candidate_inputs, Mapping):
+                    image_inputs = dict(candidate_inputs)
+                    if _resolve_pixel_values(image_inputs) is not None:
+                        break
+
+            if _resolve_pixel_values(image_inputs) is None and hasattr(processor, "image_processor"):
+                try:
+                    direct_image_inputs = processor.image_processor(images=image, return_tensors="pt")
+                    if isinstance(direct_image_inputs, Mapping):
+                        image_inputs = dict(direct_image_inputs)
+                except Exception:
+                    pass
+
+            if tokenizer:
+                text_inputs = tokenizer(
+                    formatted_text,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=2048,
+                )
+            else:
+                text_inputs = {}
+
+            inputs = {**image_inputs, **text_inputs}
 
         # Ensure a canonical pixel_values key exists if we detected any image tensor key.
         resolved_pixels = _resolve_pixel_values(inputs)
