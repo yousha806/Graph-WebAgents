@@ -163,8 +163,10 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             # Assume it's already a PIL Image
             image = screenshot
         
-        # Process image only with processor
-        image_inputs = processor(images=image, return_tensors="pt")
+        # Process image with processor. New transformers processors may require a `text` or
+        # `text_target` argument; pass an empty text string so image-only use still works
+        # and any tokenizer-based text inputs (below) will overwrite processor text fields.
+        image_inputs = processor(images=image, text="", return_tensors="pt")
         
         # Tokenize text only with tokenizer
         if tokenizer:
