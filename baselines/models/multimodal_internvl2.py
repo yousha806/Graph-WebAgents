@@ -117,10 +117,34 @@ def _build_manual_pixel_values(image, device):
         arr = arr.transpose(2, 0, 1)
         px = torch.from_numpy(arr).unsqueeze(0)
 
-    px = px.to(device)
-    if torch.cuda.is_available():
-        px = px.to(dtype=torch.float16)
-    return px
+    return px.to(device)
+
+
+def _infer_vision_dtype(model):
+    """Infer the expected dtype for image tensors from vision-related modules."""
+    for attr in ["vision_model", "vision_tower", "vit"]:
+        module = getattr(model, attr, None)
+        if module is not None:
+            try:
+                return next(module.parameters()).dtype
+            except StopIteration:
+                pass
+            except Exception:
+                pass
+
+    # Fallback to any model parameter dtype
+    try:
+        return next(model.parameters()).dtype
+    except Exception:
+        return torch.float32
+
+
+def _build_default_image_flags(pixel_values):
+    """Build minimal image_flags expected by InternVL forward paths."""
+    if pixel_values is None or not torch.is_tensor(pixel_values):
+        return None
+    bsz = int(pixel_values.shape[0]) if pixel_values.ndim > 0 else 1
+    return torch.ones((bsz, 1), dtype=torch.long, device=pixel_values.device)
 
 
 def _predict_with_chat_api(model, tokenizer, image, prompt_text, gen_kwargs, device, manual_pixel_values=None):
@@ -210,6 +234,7 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
     if torch.cuda.is_available():
         model = model.cuda()
     model.eval()
+    vision_dtype = _infer_vision_dtype(model)
     
     # Load processor and tokenizer separately for InternVL2
     processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True, token=HF_TOKEN)
@@ -381,8 +406,11 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             resolved_pixels = _resolve_pixel_values(image_inputs)
         if resolved_pixels is None and manual_pixel_values is not None:
             resolved_pixels = manual_pixel_values
-        if resolved_pixels is not None and "pixel_values" not in inputs:
+        if resolved_pixels is not None:
+            resolved_pixels = resolved_pixels.to(device=device, dtype=vision_dtype)
             inputs["pixel_values"] = resolved_pixels
+            if "image_flags" not in inputs:
+                inputs["image_flags"] = _build_default_image_flags(resolved_pixels)
 
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -411,6 +439,10 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                     generate_inputs["attention_mask"] = inputs["attention_mask"]
                 if pixel_values is not None:
                     generate_inputs["pixel_values"] = pixel_values
+                    if "image_flags" in inputs:
+                        generate_inputs["image_flags"] = inputs["image_flags"]
+                    else:
+                        generate_inputs["image_flags"] = _build_default_image_flags(pixel_values)
 
                 # If we have no image tensor, use chat API directly.
                 if pixel_values is None:
@@ -491,6 +523,8 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                         for k, v in inputs.items()
                         if k in ["input_ids", "attention_mask", "position_ids", "image_flags"]
                     }
+                    if "image_flags" not in fallback_inputs:
+                        fallback_inputs["image_flags"] = _build_default_image_flags(pixel_values)
                     try:
                         outputs = model(pixel_values=pixel_values, **fallback_inputs)
                     except TypeError:
