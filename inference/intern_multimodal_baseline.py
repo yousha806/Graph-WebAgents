@@ -46,6 +46,10 @@ from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 
+# Some Mind2Web screenshots are very large; raise PIL's limit to avoid
+# DecompressionBombWarning / DecompressionBombError.
+Image.MAX_IMAGE_PIXELS = 300_000_000
+
 # Optional: lm-format-enforcer for hard JSON-schema-constrained decoding.
 try:
     from lm_format_enforcer import JsonSchemaParser
@@ -284,21 +288,31 @@ def load_split_dataset(data_dir: str, split: str):
     return load_from_disk(str(split_path))
 
 
-def to_pil_image(image_field: Any) -> Image.Image:
+def to_pil_image(image_field: Any) -> Optional[Image.Image]:
+    """Convert a dataset image field to a PIL Image, or return None if unsupported."""
+    if image_field is None:
+        return None
+
     if isinstance(image_field, Image.Image):
         return image_field.convert("RGB")
 
+    if isinstance(image_field, bytes):
+        return Image.open(io.BytesIO(image_field)).convert("RGB")
+
     if isinstance(image_field, str):
-        return Image.open(image_field).convert("RGB")
+        if image_field.strip():
+            return Image.open(image_field).convert("RGB")
+        return None
 
     if isinstance(image_field, dict):
         path = image_field.get("path")
         if path:
             return Image.open(path).convert("RGB")
-        if image_field.get("bytes") is not None:
-            return Image.open(io.BytesIO(image_field["bytes"])).convert("RGB")
+        raw_bytes = image_field.get("bytes")
+        if raw_bytes is not None:
+            return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
 
-    raise ValueError("Unsupported screenshot format from dataset row")
+    return None
 
 
 def candidate_lines(action_reprs: List[str]) -> str:
@@ -599,8 +613,15 @@ def run_single_baseline(
     with out_file.open("a", encoding="utf8") as handle:
         for idx in tqdm(iterator, desc=f"{baseline['name']} | {split}"):
             row = dataset[idx]
-            image = to_pil_image(row["screenshot"])
-            pixel_values = pil_to_pixel_values(image, model_dtype)
+            image = to_pil_image(row.get("screenshot"))
+            if image is None:
+                tqdm.write(f"[WARN] Skipping idx={idx}: screenshot is None or unsupported format")
+                continue
+            try:
+                pixel_values = pil_to_pixel_values(image, model_dtype)
+            except Exception as exc:
+                tqdm.write(f"[WARN] Skipping idx={idx}: image preprocessing failed: {exc}")
+                continue
             prompt = build_prompt(
                 row=row, html_field=args.html_field, max_html_chars=args.max_html_chars,
             )
