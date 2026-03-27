@@ -4,3 +4,10 @@ __pycache__/
 *.py[cod]
 /data/
 /outputs/
+.claude/
+.pytest_cache/
+*.pyc 
+*.jsonl 
+*.json
+baselines/models/*.json
+baselines/models/*.jsonl
