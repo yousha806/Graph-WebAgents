@@ -9,9 +9,9 @@ dependencies:
   - pip
   - pip:
     - datasets>=2.19.0
-    - torch>=2.1.0
-    - torchvision>=0.16.0
-    - transformers>=4.44.0,<4.46.0
+    - torch>=2.1.0 --index-url https://download.pytorch.org/whl/cu121
+    - torchvision>=0.16.0 --index-url https://download.pytorch.org/whl/cu121
+    - transformers>=4.51.0
     - accelerate>=0.33.0
     - huggingface_hub>=0.24.0
     - safetensors>=0.4.0
