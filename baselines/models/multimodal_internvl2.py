@@ -1,6 +1,7 @@
 import argparse
 import json
 import re
+import traceback
 import torch
 from PIL import Image
 from io import BytesIO
@@ -309,18 +310,28 @@ def _predict_with_chat_api(model, tokenizer, image, prompt_text, gen_kwargs, dev
         lambda: model.chat(tokenizer=tokenizer, query=prompt_text, image=image),
     ]
 
-    for attempt in attempts:
+    errors = []
+    for i, attempt in enumerate(attempts):
         try:
             out = attempt()
             if isinstance(out, tuple):
-                # Some APIs return (response, history)
                 out = out[0]
             if out is not None:
                 out = str(out).strip()
                 if out:
                     return out
-        except Exception:
+        except Exception as e:
+            tb = traceback.format_exc()
+            errors.append(tb)
             continue
+
+    # If we reached here, all chat attempts failed. Log first few tracebacks to help debugging.
+    if errors:
+        short = []
+        for tb in errors[:3]:
+            lines = tb.strip().splitlines()
+            short.append(lines[-1] if lines else tb)
+        print(f"Chat API attempts all failed for model={type(model).__name__}; examples: {short}")
     return None
 
 
@@ -385,7 +396,7 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             device_map=None,
             low_cpu_mem_usage=False,
             trust_remote_code=True,
-            token=HF_TOKEN,
+            use_auth_token=HF_TOKEN,
         )
     finally:
         torch.linspace = _original_linspace
@@ -398,12 +409,12 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
     vision_dtype = _infer_vision_dtype(model)
     
     # Load processor and tokenizer separately for InternVL2
-    processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True, token=HF_TOKEN)
+    processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True, use_auth_token=HF_TOKEN)
     
     # For chat template, need to load the tokenizer separately
     try:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, token=HF_TOKEN)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, use_auth_token=HF_TOKEN)
     except Exception as e:
         print(f"Warning: tokenizer loading failed ({e}), using minimal fallback")
         tokenizer = None
@@ -449,7 +460,7 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         
         # Process inputs separately: image processor and tokenizer
         image = _to_pil_image(screenshot)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         manual_pixel_values = _build_manual_pixel_values(image, device) if image is not None else None
         if image is None:
             if strict_vision:
@@ -568,7 +579,10 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         inputs = {k: v.to(device) for k, v in inputs.items()}
         inputs = _sanitize_input_ids(inputs, _infer_vocab_size(model))
 
+        # Optionally set RNG seed for reproducibility (set once before loop)
         # Generate prediction
+        # Use a per-sample local mode so chat fallback doesn't persist across samples
+        local_mode = inference_mode
         pred_text = None
         gen_kwargs = dict(
             max_new_tokens=max_new_tokens,
@@ -581,7 +595,7 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         )
 
         # Stable default path: chat API. If it fails, fall back to generate path.
-        if inference_mode == "chat":
+        if local_mode == "chat":
             chat_pred = _predict_with_chat_api(
                 model=model,
                 tokenizer=tokenizer,
@@ -595,13 +609,11 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                 pred_text = chat_pred
             else:
                 # Fall through to generate-mode path for this sample.
-                inference_mode = "generate"
+                local_mode = "generate"
 
-        if inference_mode == "generate":
+        if local_mode == "generate":
             try:
-                # Optionally set RNG seed for reproducibility
-                if seed is not None:
-                    torch.manual_seed(seed)
+                # (Seed set once before loop.)
 
                 with torch.inference_mode():
                     pixel_values = _resolve_pixel_values(inputs)
@@ -649,7 +661,7 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
                         pass
                     elif 'input_ids' in inputs and output_ids is not None:
                         generated_ids = [
-                            output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs['input_ids'], output_ids)
+                            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs['input_ids'], output_ids)
                         ]
                     else:
                         generated_ids = output_ids
