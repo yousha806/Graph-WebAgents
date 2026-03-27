@@ -161,7 +161,7 @@ def generate_cot(
     temperature: float,
 ) -> str:
     """Single model.generate() call. Returns the raw CoT JSON string."""
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
     images = _extract_images(messages)
     inputs = processor(
         text=[text],
@@ -310,7 +310,7 @@ def make_prediction_record(
 
     return {
         "split": split,
-        "baseline": variation_name,
+        "baseline": baseline_name,
         "annotation_id": row.get("annotation_id"),
         "action_uid": row.get("action_uid"),
         "gt_action_index": gt_idx,
