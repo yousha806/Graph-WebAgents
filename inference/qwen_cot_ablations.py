@@ -67,6 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", default="inference_outputs/qwen_cot_ablations")
     parser.add_argument("--max_html_chars", type=int, default=15000)
     parser.add_argument("--dtype", default="float16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--quantization", default=None, choices=[None, "bitsandbytes", "awq", "gptq"],
+                        help="Quantization method. 'bitsandbytes' for 4-bit.")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--max_model_len", type=int, default=8192)
     parser.add_argument("--limit", type=int, default=None, help="Max examples per split")
@@ -75,19 +77,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_vllm_model(model_name: str, dtype: str, gpu_memory_utilization: float, max_model_len: int):
+def load_vllm_model(model_name: str, dtype: str, gpu_memory_utilization: float, max_model_len: int, quantization: str = None):
     from vllm import LLM
     from transformers import AutoProcessor
 
-    print(f"Loading {model_name} with vLLM (dtype={dtype}, max_model_len={max_model_len})...")
-    llm = LLM(
+    print(f"Loading {model_name} with vLLM (dtype={dtype}, quantization={quantization}, max_model_len={max_model_len})...")
+    llm_kwargs = dict(
         model=model_name,
         dtype=dtype,
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
         limit_mm_per_prompt={"image": 1},
         trust_remote_code=True,
+        enforce_eager=True,
     )
+    if quantization == "bitsandbytes":
+        llm_kwargs["quantization"] = "bitsandbytes"
+        llm_kwargs["load_format"] = "bitsandbytes"
+    elif quantization in ("awq", "gptq"):
+        llm_kwargs["quantization"] = quantization
+
+    llm = LLM(**llm_kwargs)
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     return llm, processor
 
@@ -349,7 +359,7 @@ def run_variation(
 def main() -> None:
     args = parse_args()
     llm, processor = load_vllm_model(
-        args.model_name, args.dtype, args.gpu_memory_utilization, args.max_model_len
+        args.model_name, args.dtype, args.gpu_memory_utilization, args.max_model_len, args.quantization
     )
 
     for split in args.splits:
