@@ -170,7 +170,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--quantization",
-        default="none",
+        default="4bit",
         choices=["none", "4bit", "8bit"],
         help="Optional bitsandbytes quantization mode",
     )
