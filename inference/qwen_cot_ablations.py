@@ -168,8 +168,7 @@ def generate_cot(
         images=images,
         padding=True,
         return_tensors="pt",
-        min_pixels=MIN_PIXELS,
-        max_pixels=MAX_PIXELS,
+        processor_kwargs={"min_pixels": MIN_PIXELS, "max_pixels": MAX_PIXELS},
     ).to("cuda")
 
     with torch.inference_mode():
