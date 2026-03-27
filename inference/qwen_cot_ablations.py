@@ -1,12 +1,12 @@
-"""Run Qwen2-VL-7B CoT ablations for Mind2Web next-action prediction.
+"""Run Qwen3-VL-8B-Instruct CoT ablations for Mind2Web next-action prediction.
 
 Runs all 6 combinations of:
   temperatures   : 0.1, 0.3, 0.5
   max_new_tokens : 256, 512
 
-Single-pass inference: the model generates a CoT JSON response containing
-"reasoning" and "top3_action_indices". The top-3 ordering is the model's
-own self-ranking from its reasoning chain.
+Uses vLLM for fast batched inference. Single-pass: the model generates a CoT
+JSON response containing "reasoning" and "top3_action_indices". The top-3
+ordering is the model's own self-ranking from its reasoning chain.
 
 Each combination writes its own JSONL file under --output_dir:
   preds_qwen_cot_t<temp>_n<tokens>_<split>.jsonl
@@ -26,13 +26,10 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import torch
 from datasets import load_from_disk
 from tqdm import tqdm
 
 MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
-MAX_PIXELS = 1024 * 28 * 28
-MIN_PIXELS = 256 * 28 * 28
 DEFAULT_SPLITS = ["test_website"]
 
 VARIATIONS = [
@@ -54,14 +51,13 @@ IMPORTANT: all JSON values must be properly quoted strings or arrays of integers
 }'''
 
 
-
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Qwen2-VL-7B CoT ablations (temperature × max_new_tokens)"
+        description="Qwen3-VL-8B CoT ablations via vLLM (temperature x max_new_tokens)"
     )
     parser.add_argument("--model_name", default=MODEL_NAME)
     parser.add_argument("--data_dir", default="data/mind2web",
@@ -70,42 +66,30 @@ def parse_args() -> argparse.Namespace:
                         choices=["train", "test_task", "test_website", "test_domain"])
     parser.add_argument("--output_dir", default="inference_outputs/qwen_cot_ablations")
     parser.add_argument("--max_html_chars", type=int, default=15000)
-    parser.add_argument("--quantization", default="4bit", choices=["none", "4bit", "8bit"])
-    parser.add_argument("--dtype", default="fp16", choices=["bf16", "fp16", "fp32"])
+    parser.add_argument("--dtype", default="float16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
+    parser.add_argument("--max_model_len", type=int, default=8192)
     parser.add_argument("--limit", type=int, default=None, help="Max examples per split")
     parser.add_argument("--resume", action="store_true",
                         help="Skip already-written rows in existing JSONL files")
     return parser.parse_args()
 
 
-def resolve_dtype(dtype_name: str) -> torch.dtype:
-    return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[dtype_name]
+def load_vllm_model(model_name: str, dtype: str, gpu_memory_utilization: float, max_model_len: int):
+    from vllm import LLM
+    from transformers import AutoProcessor
 
-
-def load_qwen_model(model_name: str, quantization: str, dtype: torch.dtype):
-    from transformers import AutoProcessor, BitsAndBytesConfig, Qwen3VLForConditionalGeneration
-
-    model_kwargs: Dict[str, Any] = {
-        "device_map": "auto",
-        "torch_dtype": dtype,
-        "attn_implementation": "sdpa",
-        "trust_remote_code": True,
-    }
-    if quantization == "4bit":
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=dtype,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-        )
-    elif quantization == "8bit":
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-
-    print(f"Loading {model_name} (quantization={quantization}, dtype={dtype})...")
-    model = Qwen3VLForConditionalGeneration.from_pretrained(model_name, **model_kwargs)
+    print(f"Loading {model_name} with vLLM (dtype={dtype}, max_model_len={max_model_len})...")
+    llm = LLM(
+        model=model_name,
+        dtype=dtype,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
+        limit_mm_per_prompt={"image": 1},
+        trust_remote_code=True,
+    )
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-    model.eval()
-    return model, processor
+    return llm, processor
 
 
 # ---------------------------------------------------------------------------
@@ -140,49 +124,14 @@ def build_messages(row: Dict[str, Any], max_html_chars: int) -> List[Dict]:
     ]
 
 
-def _extract_images(messages: List[Dict]) -> List[Any]:
-    return [
-        content["image"]
-        for msg in messages
-        for content in msg["content"]
-        if content["type"] == "image"
-    ]
-
-
-# ---------------------------------------------------------------------------
-# CoT generation
-# ---------------------------------------------------------------------------
-
-def generate_cot(
-    model,
-    processor,
-    messages: List[Dict],
-    max_new_tokens: int,
-    temperature: float,
-) -> str:
-    """Single model.generate() call. Returns the raw CoT JSON string."""
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-    images = _extract_images(messages)
-    inputs = processor(
-        text=[text],
-        images=images,
-        padding=True,
-        return_tensors="pt",
-        processor_kwargs={"min_pixels": MIN_PIXELS, "max_pixels": MAX_PIXELS},
-    ).to("cuda")
-
-    with torch.inference_mode():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-        )
-
-    generated = [out[len(inp):] for inp, out in zip(inputs.input_ids, output_ids)]
-    return processor.batch_decode(
-        generated, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )[0]
+def build_vllm_input(row: Dict[str, Any], processor, max_html_chars: int) -> Dict:
+    """Build a single vLLM input dict with prompt text and image data."""
+    messages = build_messages(row, max_html_chars)
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+    )
+    image = row["screenshot"]
+    return {"prompt": text, "multi_modal_data": {"image": image}}
 
 
 # ---------------------------------------------------------------------------
@@ -332,13 +281,15 @@ def make_prediction_record(
 # ---------------------------------------------------------------------------
 
 def run_variation(
-    model,
+    llm,
     processor,
     dataset,
     split: str,
     variation: Dict[str, Any],
     args: argparse.Namespace,
 ) -> None:
+    from vllm import SamplingParams
+
     temperature = variation["temperature"]
     max_new_tokens = variation["max_new_tokens"]
     t_str = str(temperature).replace(".", "")
@@ -357,39 +308,56 @@ def run_variation(
             print(f"  Skipping {name} on {split}: already complete ({start_idx}/{total})")
             return
 
-    print(f"  Running {name} on {split} [{start_idx}/{total}]")
+    print(f"  Building inputs for {name} on {split} [{start_idx}/{total}]...")
+    rows = []
+    vllm_inputs = []
+    for idx in tqdm(range(start_idx, total), desc="building prompts"):
+        row = dataset[idx]
+        rows.append(row)
+        try:
+            vllm_inputs.append(build_vllm_input(row, processor, args.max_html_chars))
+        except Exception as exc:
+            print(f"    [ERROR] build idx={idx}: {exc}")
+            vllm_inputs.append(None)
+
+    sampling_params = SamplingParams(
+        temperature=temperature,
+        max_tokens=max_new_tokens,
+    )
+
+    print(f"  Generating {len(vllm_inputs)} samples with vLLM...")
+    valid_pairs = [(i, inp) for i, inp in enumerate(vllm_inputs) if inp is not None]
+    raw_outputs = [""] * len(rows)
+
+    if valid_pairs:
+        indices, inputs = zip(*valid_pairs)
+        outputs = llm.generate(list(inputs), sampling_params)
+        for i, output in zip(indices, outputs):
+            raw_outputs[i] = output.outputs[0].text
+
+    print(f"  Writing results to {out_file}...")
     with out_file.open("a", encoding="utf-8") as handle:
-        for idx in tqdm(range(start_idx, total), desc=f"{name}|{split}"):
-            row = dataset[idx]
+        for row, raw_output in zip(rows, raw_outputs):
             num_candidates = len(row.get("action_reprs", []))
-            messages = build_messages(row, args.max_html_chars)
-
-            try:
-                raw_output = generate_cot(model, processor, messages, max_new_tokens, temperature)
-            except Exception as exc:
-                raw_output = ""
-                print(f"    [ERROR] idx={idx}: {exc}")
-
             parsed = parse_cot_output(raw_output, num_candidates)
             record = make_prediction_record(row, split, name, parsed, raw_output)
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-            handle.flush()
-            torch.cuda.empty_cache()
 
     print(f"  Saved: {out_file}")
 
 
 def main() -> None:
     args = parse_args()
-    dtype = resolve_dtype(args.dtype)
-    model, processor = load_qwen_model(args.model_name, args.quantization, dtype)
+    llm, processor = load_vllm_model(
+        args.model_name, args.dtype, args.gpu_memory_utilization, args.max_model_len
+    )
 
     for split in args.splits:
         split_path = Path(args.data_dir) / split
         print(f"\nLoading split: {split_path}")
         dataset = load_from_disk(str(split_path))
         for variation in VARIATIONS:
-            run_variation(model, processor, dataset, split, variation, args)
+            run_variation(llm, processor, dataset, split, variation, args)
 
     print("\nAll variations complete.")
 
