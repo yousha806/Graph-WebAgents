@@ -580,7 +580,7 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             early_stopping=early_stopping,
         )
 
-        # Stable default path: chat API. Keep generate path optional for debugging.
+        # Stable default path: chat API. If it fails, fall back to generate path.
         if inference_mode == "chat":
             chat_pred = _predict_with_chat_api(
                 model=model,
@@ -593,12 +593,9 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             )
             if chat_pred is not None:
                 pred_text = chat_pred
-            elif strict_vision:
-                raise RuntimeError(
-                    f"Chat inference failed in strict vision mode for id={row.get('annotation_id') or row.get('id')}"
-                )
             else:
-                pred_text = "0"
+                # Fall through to generate-mode path for this sample.
+                inference_mode = "generate"
 
         if inference_mode == "generate":
             try:
