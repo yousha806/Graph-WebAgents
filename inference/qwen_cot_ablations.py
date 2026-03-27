@@ -30,6 +30,8 @@ from datasets import load_from_disk
 from tqdm import tqdm
 
 MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+MAX_PIXELS = 512 * 28 * 28   # ~2048 image tokens max; keeps room for HTML at max_model_len=8192
+MIN_PIXELS = 256 * 28 * 28
 DEFAULT_SPLITS = ["test_website"]
 
 VARIATIONS = [
@@ -143,6 +145,13 @@ def build_vllm_input(row: Dict[str, Any], processor, max_html_chars: int) -> Dic
         messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
     )
     image = row["screenshot"]
+    # Resize image to stay within pixel budget before passing to vLLM
+    if hasattr(image, "size"):
+        w, h = image.size
+        total_pixels = w * h
+        if total_pixels > MAX_PIXELS:
+            scale = (MAX_PIXELS / total_pixels) ** 0.5
+            image = image.resize((int(w * scale), int(h * scale)))
     return {"prompt": text, "multi_modal_data": {"image": image}}
 
 
