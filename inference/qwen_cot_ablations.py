@@ -71,6 +71,8 @@ def parse_args() -> argparse.Namespace:
                         help="Quantization method. 'bitsandbytes' for 4-bit.")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--max_model_len", type=int, default=8192)
+    parser.add_argument("--batch_size", type=int, default=50,
+                        help="Number of samples to submit to vLLM at once")
     parser.add_argument("--limit", type=int, default=None, help="Max examples per split")
     parser.add_argument("--resume", action="store_true",
                         help="Skip already-written rows in existing JSONL files")
@@ -318,40 +320,39 @@ def run_variation(
             print(f"  Skipping {name} on {split}: already complete ({start_idx}/{total})")
             return
 
-    print(f"  Building inputs for {name} on {split} [{start_idx}/{total}]...")
-    rows = []
-    vllm_inputs = []
-    for idx in tqdm(range(start_idx, total), desc="building prompts"):
-        row = dataset[idx]
-        rows.append(row)
-        try:
-            vllm_inputs.append(build_vllm_input(row, processor, args.max_html_chars))
-        except Exception as exc:
-            print(f"    [ERROR] build idx={idx}: {exc}")
-            vllm_inputs.append(None)
-
     sampling_params = SamplingParams(
         temperature=temperature,
         max_tokens=max_new_tokens,
     )
 
-    print(f"  Generating {len(vllm_inputs)} samples with vLLM...")
-    valid_pairs = [(i, inp) for i, inp in enumerate(vllm_inputs) if inp is not None]
-    raw_outputs = [""] * len(rows)
-
-    if valid_pairs:
-        indices, inputs = zip(*valid_pairs)
-        outputs = llm.generate(list(inputs), sampling_params)
-        for i, output in zip(indices, outputs):
-            raw_outputs[i] = output.outputs[0].text
-
-    print(f"  Writing results to {out_file}...")
+    print(f"  Running {name} on {split} [{start_idx}/{total}] (batch_size={args.batch_size})")
     with out_file.open("a", encoding="utf-8") as handle:
-        for row, raw_output in zip(rows, raw_outputs):
-            num_candidates = len(row.get("action_reprs", []))
-            parsed = parse_cot_output(raw_output, num_candidates)
-            record = make_prediction_record(row, split, name, parsed, raw_output)
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        for batch_start in tqdm(range(start_idx, total, args.batch_size), desc=f"{name}|{split}"):
+            batch_end = min(batch_start + args.batch_size, total)
+            rows, vllm_inputs = [], []
+            for idx in range(batch_start, batch_end):
+                row = dataset[idx]
+                rows.append(row)
+                try:
+                    vllm_inputs.append(build_vllm_input(row, processor, args.max_html_chars))
+                except Exception as exc:
+                    print(f"    [ERROR] build idx={idx}: {exc}")
+                    vllm_inputs.append(None)
+
+            valid_pairs = [(i, inp) for i, inp in enumerate(vllm_inputs) if inp is not None]
+            raw_outputs = [""] * len(rows)
+            if valid_pairs:
+                indices, inputs = zip(*valid_pairs)
+                outputs = llm.generate(list(inputs), sampling_params, use_tqdm=False)
+                for i, output in zip(indices, outputs):
+                    raw_outputs[i] = output.outputs[0].text
+
+            for row, raw_output in zip(rows, raw_outputs):
+                num_candidates = len(row.get("action_reprs", []))
+                parsed = parse_cot_output(raw_output, num_candidates)
+                record = make_prediction_record(row, split, name, parsed, raw_output)
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
 
     print(f"  Saved: {out_file}")
 
