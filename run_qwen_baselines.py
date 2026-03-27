@@ -67,10 +67,8 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import AutoProcessor, BitsAndBytesConfig
 
-# Qwen3-8B-VL uses the Qwen2_5_VL architecture class in transformers.
-# The model card / config will map it correctly when trust_remote_code is not needed.
 try:
-    from transformers import Qwen2_5_VLForConditionalGeneration as Qwen3VLForConditionalGeneration
+    from transformers import Qwen3VLForConditionalGeneration
     _QWEN_VL_AVAILABLE = True
 except ImportError:
     _QWEN_VL_AVAILABLE = False
@@ -393,9 +391,9 @@ def build_qwen_messages(
     """
     task    = row.get("confirmed_task", "")
     dom     = truncate(
-        row.get("dom_content", "") or row.get("html", "") or "",
+        row.get("cleaned_html", "") or row.get("raw_html", "") or "",
         max_dom_chars,
-        "dom_content",
+        "cleaned_html",
     )
     actions = row.get("action_reprs", [])
 
@@ -753,7 +751,7 @@ def make_failure_record(
     pred_value  = extract_value(pred_action_repr or "")
 
     # html_snippet: first 500 chars of the DOM for quick inspection
-    dom_full     = row.get("dom_content", "") or row.get("html", "") or ""
+    dom_full = row.get("cleaned_html", "") or row.get("raw_html", "") or ""
     html_snippet = dom_full[:500] if dom_full else None
 
     # Screenshot path (null when the dataset stores raw bytes without a path)
