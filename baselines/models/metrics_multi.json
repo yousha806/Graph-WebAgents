@@ -1,0 +1,37 @@
+{
+  "num_lines": 1019,
+  "num_parsed": 1019,
+  "parse_failure_rate": 0.0,
+  "element_accuracy": 0.3169774288518155,
+  "action_accuracy": 0.9569377990430622,
+  "exact_match": 0.29904306220095694,
+  "top_3_element_accuracy": 0.42198233562315995,
+  "mrr": 0.35348029405252424,
+  "per_action": {
+    "TYPE": {
+      "precision": 0.4166666666666667,
+      "recall": 0.7142857142857143,
+      "f1": 0.5263157894736842,
+      "support": 7
+    },
+    "HOVER": {
+      "precision": 0.2,
+      "recall": 0.05,
+      "f1": 0.08000000000000002,
+      "support": 20
+    },
+    "CLICK": {
+      "precision": 0.7932067932067932,
+      "recall": 0.9851116625310173,
+      "f1": 0.8788046485888212,
+      "support": 806
+    },
+    "SELECT": {
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "support": 3
+    }
+  },
+  "task_success_rate": 0.310107948969578
+}
