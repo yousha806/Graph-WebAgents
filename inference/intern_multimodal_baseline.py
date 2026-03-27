@@ -246,7 +246,7 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
     if quantization_config is not None:
         model_kwargs: Dict[str, Any] = {
             "trust_remote_code": True,
-            "dtype": dtype,
+            "torch_dtype": dtype,
             "low_cpu_mem_usage": True,
             "device_map": {"": 0},
             "quantization_config": quantization_config,
@@ -257,7 +257,7 @@ def load_intern_model(model_name: str, dtype: torch.dtype, quantization: str):
         model = AutoModel.from_pretrained(
             model_name,
             trust_remote_code=True,
-            dtype=dtype,
+            torch_dtype=dtype,
             low_cpu_mem_usage=False,
             use_flash_attn=use_flash_attn,
         )
