@@ -1,5 +1,6 @@
 import argparse
 import json
+import re
 import torch
 from PIL import Image
 from io import BytesIO
@@ -323,7 +324,36 @@ def _predict_with_chat_api(model, tokenizer, image, prompt_text, gen_kwargs, dev
     return None
 
 
-def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True, wrong_out: str = "wrong_preds.jsonl", num_beams: int = 4, max_new_tokens: int = 10, do_sample: bool = False, temperature: float = 1.0, top_p: float = 1.0, top_k: int = 50, early_stopping: bool = True, seed: int = None, strict_vision: bool = True):
+def _extract_pred_idx(pred_text, num_candidates):
+    """Parse a predicted candidate index from free-form model output."""
+    if pred_text is None:
+        return None
+    s = str(pred_text).strip()
+    if not s:
+        return None
+
+    # Prefer explicit standalone integers first.
+    for m in re.finditer(r"\b\d+\b", s):
+        try:
+            v = int(m.group(0))
+        except Exception:
+            continue
+        if 0 <= v < num_candidates:
+            return v
+
+    # Last resort: concatenate digits.
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if digits:
+        try:
+            v = int(digits)
+            if 0 <= v < num_candidates:
+                return v
+        except Exception:
+            pass
+    return None
+
+
+def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl", extract_states: bool = True, wrong_out: str = "wrong_preds.jsonl", num_beams: int = 4, max_new_tokens: int = 10, do_sample: bool = False, temperature: float = 1.0, top_p: float = 1.0, top_k: int = 50, early_stopping: bool = True, seed: int = None, strict_vision: bool = True, inference_mode: str = "chat"):
     print(f"Loading model {MODEL_NAME}...")
     
     # ---- InternVL2 workarounds ----
@@ -549,139 +579,156 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
             top_k=top_k,
             early_stopping=early_stopping,
         )
-        try:
-            # Optionally set RNG seed for reproducibility
-            if seed is not None:
-                torch.manual_seed(seed)
 
-            with torch.inference_mode():
-                pixel_values = _resolve_pixel_values(inputs)
-                generate_inputs = {}
-                if "input_ids" in inputs:
-                    generate_inputs["input_ids"] = inputs["input_ids"]
-                if "attention_mask" in inputs:
-                    generate_inputs["attention_mask"] = inputs["attention_mask"]
-                if pixel_values is not None:
-                    generate_inputs["pixel_values"] = pixel_values
-                    if "image_flags" in inputs:
-                        generate_inputs["image_flags"] = inputs["image_flags"]
-                    else:
-                        generate_inputs["image_flags"] = _build_default_image_flags(pixel_values)
-
-                # If we have no image tensor, use chat API directly.
-                if pixel_values is None:
-                    chat_pred = _predict_with_chat_api(
-                        model=model,
-                        tokenizer=tokenizer,
-                        image=image,
-                        prompt_text=text_content,
-                        gen_kwargs=gen_kwargs,
-                        device=device,
-                        manual_pixel_values=manual_pixel_values,
-                    )
-                    if chat_pred is not None:
-                        pred_text = chat_pred
-                        output_ids = None
-                    else:
-                        if strict_vision:
-                            raise RuntimeError(
-                                f"No image tensor available for generate and chat fallback failed for id={row.get('annotation_id') or row.get('id')}. "
-                                f"Input keys: {list(inputs.keys())}"
-                            )
-                        output_ids = model.generate(**generate_inputs, **gen_kwargs)
-                else:
-                    if not generate_inputs:
-                        generate_inputs = inputs
-                    output_ids = model.generate(**generate_inputs, **gen_kwargs)
-
-            # Decode output
-            try:
-                if pred_text is not None:
-                    pass
-                elif 'input_ids' in inputs and output_ids is not None:
-                    generated_ids = [
-                        output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs['input_ids'], output_ids)
-                    ]
-                else:
-                    generated_ids = output_ids
-
-                if pred_text is not None:
-                    pass
-                elif tokenizer:
-                    pred_text = tokenizer.batch_decode(
-                        generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-                    )[0]
-                else:
-                    pred_text = str(output_ids[0])
-            except Exception:
-                if pred_text is None:
-                    pred_text = str(output_ids[-1]) if output_ids is not None and len(output_ids) > 0 else "0"
-
-        except (AssertionError, AttributeError, RuntimeError) as e:
-            # Last resort: do forward pass + greedy decode manually
-            print(f"Generate failed ({type(e).__name__}), using forward pass fallback")
-            try:
-                with torch.inference_mode():
-                    # Try chat API first in fallback path.
-                    chat_pred = _predict_with_chat_api(
-                        model=model,
-                        tokenizer=tokenizer,
-                        image=image,
-                        prompt_text=text_content,
-                        gen_kwargs=gen_kwargs,
-                        device=device,
-                        manual_pixel_values=manual_pixel_values,
-                    )
-                    if chat_pred is not None:
-                        pred_text = chat_pred
-                        raise StopIteration("chat-success")
-
-                    # Get logits from forward pass. Some wrappers use non-standard image keys
-                    # and/or require pixel_values as the first positional argument.
-                    pixel_values = _resolve_pixel_values(inputs)
-                    if pixel_values is None:
-                        raise RuntimeError(f"No image tensor found in inputs. Keys: {list(inputs.keys())}")
-
-                    fallback_inputs = {
-                        k: v
-                        for k, v in inputs.items()
-                        if k in ["input_ids", "attention_mask", "position_ids", "image_flags"]
-                    }
-                    if "image_flags" not in fallback_inputs:
-                        fallback_inputs["image_flags"] = _build_default_image_flags(pixel_values)
-                    try:
-                        outputs = model(pixel_values=pixel_values, **fallback_inputs)
-                    except TypeError:
-                        # Retry by passing pixel_values positionally
-                        outputs = model(pixel_values, **fallback_inputs)
-
-                    logits = outputs.logits if hasattr(outputs, 'logits') else (outputs[0] if isinstance(outputs, (list, tuple)) else None)
-
-                    # Greedy: take argmax of last token
-                    if logits is None:
-                        raise RuntimeError('No logits available from forward pass')
-                    next_token_id = logits[0, -1, :].argmax().item()
-                    if tokenizer:
-                        pred_text = tokenizer.decode([next_token_id], skip_special_tokens=True)
-                    else:
-                        pred_text = str(next_token_id)
-            except StopIteration:
-                pass
-            except Exception as e2:
-                if strict_vision:
-                    raise RuntimeError(
-                        f"Forward pass fallback failed in strict vision mode for id={row.get('annotation_id') or row.get('id')}: {e2}"
-                    ) from e2
-                print(f"Forward pass fallback also failed: {e2}")
+        # Stable default path: chat API. Keep generate path optional for debugging.
+        if inference_mode == "chat":
+            chat_pred = _predict_with_chat_api(
+                model=model,
+                tokenizer=tokenizer,
+                image=image,
+                prompt_text=text_content,
+                gen_kwargs=gen_kwargs,
+                device=device,
+                manual_pixel_values=manual_pixel_values,
+            )
+            if chat_pred is not None:
+                pred_text = chat_pred
+            elif strict_vision:
+                raise RuntimeError(
+                    f"Chat inference failed in strict vision mode for id={row.get('annotation_id') or row.get('id')}"
+                )
+            else:
                 pred_text = "0"
 
+        if inference_mode == "generate":
+            try:
+                # Optionally set RNG seed for reproducibility
+                if seed is not None:
+                    torch.manual_seed(seed)
+
+                with torch.inference_mode():
+                    pixel_values = _resolve_pixel_values(inputs)
+                    generate_inputs = {}
+                    if "input_ids" in inputs:
+                        generate_inputs["input_ids"] = inputs["input_ids"]
+                    if "attention_mask" in inputs:
+                        generate_inputs["attention_mask"] = inputs["attention_mask"]
+                    if pixel_values is not None:
+                        generate_inputs["pixel_values"] = pixel_values
+                        if "image_flags" in inputs:
+                            generate_inputs["image_flags"] = inputs["image_flags"]
+                        else:
+                            generate_inputs["image_flags"] = _build_default_image_flags(pixel_values)
+
+                    # If we have no image tensor, use chat API directly.
+                    if pixel_values is None:
+                        chat_pred = _predict_with_chat_api(
+                            model=model,
+                            tokenizer=tokenizer,
+                            image=image,
+                            prompt_text=text_content,
+                            gen_kwargs=gen_kwargs,
+                            device=device,
+                            manual_pixel_values=manual_pixel_values,
+                        )
+                        if chat_pred is not None:
+                            pred_text = chat_pred
+                            output_ids = None
+                        else:
+                            if strict_vision:
+                                raise RuntimeError(
+                                    f"No image tensor available for generate and chat fallback failed for id={row.get('annotation_id') or row.get('id')}. "
+                                    f"Input keys: {list(inputs.keys())}"
+                                )
+                            output_ids = model.generate(**generate_inputs, **gen_kwargs)
+                    else:
+                        if not generate_inputs:
+                            generate_inputs = inputs
+                        output_ids = model.generate(**generate_inputs, **gen_kwargs)
+
+                # Decode output
+                try:
+                    if pred_text is not None:
+                        pass
+                    elif 'input_ids' in inputs and output_ids is not None:
+                        generated_ids = [
+                            output_ids[len(input_ids):] for input_ids, output_ids in zip(inputs['input_ids'], output_ids)
+                        ]
+                    else:
+                        generated_ids = output_ids
+
+                    if pred_text is not None:
+                        pass
+                    elif tokenizer:
+                        pred_text = tokenizer.batch_decode(
+                            generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
+                        )[0]
+                    else:
+                        pred_text = str(output_ids[0])
+                except Exception:
+                    if pred_text is None:
+                        pred_text = str(output_ids[-1]) if output_ids is not None and len(output_ids) > 0 else "0"
+
+            except (AssertionError, AttributeError, RuntimeError):
+                # Last resort: do forward pass + greedy decode manually
+                print("Generate failed, using forward pass fallback")
+                try:
+                    with torch.inference_mode():
+                        # Try chat API first in fallback path.
+                        chat_pred = _predict_with_chat_api(
+                            model=model,
+                            tokenizer=tokenizer,
+                            image=image,
+                            prompt_text=text_content,
+                            gen_kwargs=gen_kwargs,
+                            device=device,
+                            manual_pixel_values=manual_pixel_values,
+                        )
+                        if chat_pred is not None:
+                            pred_text = chat_pred
+                            raise StopIteration("chat-success")
+
+                        # Get logits from forward pass. Some wrappers use non-standard image keys
+                        # and/or require pixel_values as the first positional argument.
+                        pixel_values = _resolve_pixel_values(inputs)
+                        if pixel_values is None:
+                            raise RuntimeError(f"No image tensor found in inputs. Keys: {list(inputs.keys())}")
+
+                        fallback_inputs = {
+                            k: v
+                            for k, v in inputs.items()
+                            if k in ["input_ids", "attention_mask", "position_ids", "image_flags"]
+                        }
+                        if "image_flags" not in fallback_inputs:
+                            fallback_inputs["image_flags"] = _build_default_image_flags(pixel_values)
+                        try:
+                            outputs = model(pixel_values=pixel_values, **fallback_inputs)
+                        except TypeError:
+                            # Retry by passing pixel_values positionally
+                            outputs = model(pixel_values, **fallback_inputs)
+
+                        logits = outputs.logits if hasattr(outputs, 'logits') else (outputs[0] if isinstance(outputs, (list, tuple)) else None)
+
+                        # Greedy: take argmax of last token
+                        if logits is None:
+                            raise RuntimeError('No logits available from forward pass')
+                        next_token_id = logits[0, -1, :].argmax().item()
+                        if tokenizer:
+                            pred_text = tokenizer.decode([next_token_id], skip_special_tokens=True)
+                        else:
+                            pred_text = str(next_token_id)
+                except StopIteration:
+                    pass
+                except Exception as e2:
+                    if strict_vision:
+                        raise RuntimeError(
+                            f"Forward pass fallback failed in strict vision mode for id={row.get('annotation_id') or row.get('id')}: {e2}"
+                        ) from e2
+                    print(f"Forward pass fallback also failed: {e2}")
+                    pred_text = "0"
+
         # Parse predicted index
-        pred_idx = None
-        try:
-            clean_pred = "".join(filter(str.isdigit, pred_text.strip()))
-            pred_idx = int(clean_pred) if clean_pred else None
-        except Exception:
-            pred_idx = None
+        pred_idx = _extract_pred_idx(pred_text, len(candidates))
 
         # Map to pred_element and pred_action
         pred_element = candidates[pred_idx] if (pred_idx is not None and 0 <= pred_idx < len(candidates)) else None
@@ -736,11 +783,14 @@ def run(dataset_split: str = "test_website", preds_out: str = "out_preds.jsonl",
         }
         results.append(rec)
 
-        # Track incorrect examples separately
-        if pred_idx is not None and target is not None and pred_idx != target:
+        # Track correctness/incorrectness explicitly; parse failures are incorrect.
+        is_correct = bool(pred_idx is not None and target is not None and pred_idx == target)
+        is_incorrect = bool(target is not None and not is_correct)
+
+        if is_incorrect:
             wrong_results.append(rec)
 
-        if pred_idx is not None and target is not None and pred_idx == target:
+        if is_correct:
             correct += 1
         total += 1
 
@@ -775,6 +825,7 @@ if __name__ == "__main__":
     p.add_argument("--no-early-stopping", dest="early_stopping", action="store_false", help="Disable early stopping for beam search")
     p.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducibility")
     p.add_argument("--allow-text-only-fallback", dest="strict_vision", action="store_false", help="Allow text-only fallback when image tensors are missing (not recommended)")
+    p.add_argument("--inference-mode", choices=["chat", "generate"], default="chat", help="Inference path: chat (stable) or generate (experimental)")
     args = p.parse_args()
-    run(dataset_split=args.split, preds_out=args.preds_out, extract_states=args.extract_states, wrong_out=args.wrong_out, num_beams=args.num_beams, max_new_tokens=args.max_new_tokens, do_sample=args.do_sample, temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, early_stopping=args.early_stopping, seed=args.seed, strict_vision=args.strict_vision)
+    run(dataset_split=args.split, preds_out=args.preds_out, extract_states=args.extract_states, wrong_out=args.wrong_out, num_beams=args.num_beams, max_new_tokens=args.max_new_tokens, do_sample=args.do_sample, temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, early_stopping=args.early_stopping, seed=args.seed, strict_vision=args.strict_vision, inference_mode=args.inference_mode)
 
