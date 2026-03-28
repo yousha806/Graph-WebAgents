@@ -35,9 +35,8 @@ MIN_PIXELS = 256 * 28 * 28
 DEFAULT_SPLITS = ["test_website"]
 
 VARIATIONS = [
-    {"temperature": t, "max_new_tokens": n}
+    {"temperature": t, "max_new_tokens": 512}
     for t in [0.1, 0.3, 0.5]
-    for n in [256, 512]
 ]
 
 _JSON_SCHEMA_COT = '''\
