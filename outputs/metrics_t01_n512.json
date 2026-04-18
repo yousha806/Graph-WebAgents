@@ -1,0 +1,67 @@
+{
+  "aggregate": {
+    "num_files": 1,
+    "macro_ElemAcc": 0.3502653525398029,
+    "macro_ActionAcc": 0.7998483699772555,
+    "macro_Top3Elem": 0.6171341925701289,
+    "macro_MRR": 0.46613596158706083,
+    "macro_TaskSuccess": 0.06338028169014084,
+    "macro_StepAcc": 0.34495830174374525,
+    "macro_prediction_parse_failure_rate": 0.002274450341167551,
+    "macro_action_type_parse_failure_rate": 0.0
+  },
+  "files": [
+    {
+      "file": "inference_outputs/qwen_cot_ablations/preds_qwen_cot_t01_n512_test_website.jsonl",
+      "num_lines": 1319,
+      "num_parsed": 1319,
+      "json_parse_failure_rate": 0.0,
+      "prediction_parse_failure_rate": 0.002274450341167551,
+      "action_type_parse_failure_rate": 0.0,
+      "ElemAcc": 0.3502653525398029,
+      "ActionAcc": 0.7998483699772555,
+      "Top3Elem": 0.6171341925701289,
+      "MRR": 0.46613596158706083,
+      "TaskSuccess": 0.06338028169014084,
+      "StepAcc": 0.34495830174374525,
+      "per_action": {
+        "CLICK": {
+          "precision": 0.9190871369294605,
+          "recall": 0.8327067669172933,
+          "f1": 0.873767258382643,
+          "support": 1064
+        },
+        "HOVER": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "SCROLL": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "SELECT": {
+          "precision": 0.6702127659574468,
+          "recall": 0.6702127659574468,
+          "f1": 0.6702127659574468,
+          "support": 94
+        },
+        "TYPE": {
+          "precision": 0.4108527131782946,
+          "recall": 0.6583850931677019,
+          "f1": 0.5059665871121719,
+          "support": 161
+        }
+      },
+      "baselines": [
+        "qwen_cot_t01_n512"
+      ],
+      "splits": [
+        "test_website"
+      ]
+    }
+  ]
+}

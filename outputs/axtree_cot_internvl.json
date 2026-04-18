@@ -1,0 +1,13 @@
+{"file": "outputs/intern_axtree_ablations/preds_intern_image_allinputs_axtree_cot_test_website.jsonl",
+      "num_lines": 1019,
+      "num_parsed": 1019,
+      "json_parse_failure_rate": 0.0,
+      "prediction_parse_failure_rate": 0.0,
+      "action_type_parse_failure_rate": 0.0,
+      "ElemAcc": 0.155053974484789,
+      "ActionAcc": 0.637524557956778,
+      "Top3Elem": 0.4141315014720314,
+      "MRR": 0.2644749754661436,
+      "TaskSuccess": 0.014084507042253521,
+      "StepAcc": 0.13850687622789784
+}

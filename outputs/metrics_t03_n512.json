@@ -1,0 +1,61 @@
+{
+  "aggregate": {
+    "num_files": 1,
+    "macro_ElemAcc": 0.352306182531894,
+    "macro_ActionAcc": 0.8076545632973503,
+    "macro_Top3Elem": 0.619234543670265,
+    "macro_MRR": 0.4685966633954851,
+    "macro_TaskSuccess": 0.056338028169014086,
+    "macro_StepAcc": 0.34838076545632973,
+    "macro_prediction_parse_failure_rate": 0.0009813542688910696,
+    "macro_action_type_parse_failure_rate": 0.0
+  },
+  "files": [
+    {
+      "file": "inference_outputs/qwen_cot_ablations/preds_qwen_cot_t03_n512_test_website.jsonl",
+      "num_lines": 1019,
+      "num_parsed": 1019,
+      "json_parse_failure_rate": 0.0,
+      "prediction_parse_failure_rate": 0.0009813542688910696,
+      "action_type_parse_failure_rate": 0.0,
+      "ElemAcc": 0.352306182531894,
+      "ActionAcc": 0.8076545632973503,
+      "Top3Elem": 0.619234543670265,
+      "MRR": 0.4685966633954851,
+      "TaskSuccess": 0.056338028169014086,
+      "StepAcc": 0.34838076545632973,
+      "per_action": {
+        "CLICK": {
+          "precision": 0.9320652173913043,
+          "recall": 0.8295042321644498,
+          "f1": 0.8777991042866282,
+          "support": 827
+        },
+        "HOVER": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "support": 0
+        },
+        "SELECT": {
+          "precision": 0.7105263157894737,
+          "recall": 0.75,
+          "f1": 0.7297297297297298,
+          "support": 72
+        },
+        "TYPE": {
+          "precision": 0.4029126213592233,
+          "recall": 0.6916666666666667,
+          "f1": 0.50920245398773,
+          "support": 120
+        }
+      },
+      "baselines": [
+        "qwen_cot_t03_n512"
+      ],
+      "splits": [
+        "test_website"
+      ]
+    }
+  ]
+}
