@@ -9,7 +9,7 @@
 # from google.colab import drive
 # drive.mount('/content/drive')
 
-import os, math, json, pickle
+import os, math, json, pickle, re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -92,10 +92,6 @@ else:                        # A100 (40 GB default)
     LEARNING_RATE    = 3e-4
 _INTERACTIVE     = {"button", "input", "a", "select", "textarea", "option", "label", "form"}
 
-ACTION_TYPES = ["CLICK", "TYPE", "SCROLL", "NOOP", "HOVER", "SELECT", "SUBMIT", "PRESS", "LOAD"]
-ACT2IDX      = {a: i for i, a in enumerate(ACTION_TYPES)}
-NUM_ACTIONS  = len(ACTION_TYPES)
-
 def _bid(c):
     if isinstance(c, dict):
         return str(c.get("backend_node_id", ""))
@@ -103,7 +99,7 @@ def _bid(c):
         try:
             d = json.loads(c)
             return str(d.get("backend_node_id", "")) if isinstance(d, dict) else c
-        except Exception:
+        except json.JSONDecodeError:
             return c
     return ""
 
@@ -120,22 +116,55 @@ def encode_texts(texts: list[str]) -> torch.Tensor:
     return sbert.encode(texts, convert_to_tensor=True,
                         show_progress_bar=False, device="cpu").float()  # (N, 384)
 
+def _tokenize_text(s: str) -> set[str]:
+    # Keep only simple alnum tokens to score lexical overlap cheaply.
+    return set(re.findall(r"[a-z0-9]+", (s or "").lower()))
+
 # =========================
 # 4. DOM → GRAPH  (identical logic to multimodal_GNN_Cross.dom_to_graph)
 #    Extra return value: backend_ids per node for label extraction.
 # =========================
-def dom_to_graph(dom_html: str):
+def dom_to_graph(dom_html: str, task_text: str = "", candidate_reprs: list[str] | None = None):
     """
     Returns:
         node_feats  : (N, NODE_FEAT_DIM=523)
         edge_index  : (2, E) long
         backend_ids : list[str] of length N  — backend_node_id attribute per element
     """
-    soup        = BeautifulSoup(dom_html or "<html></html>", "html.parser")
-    all_els     = soup.find_all(True)
-    interactive = [e for e in all_els if e.name in _INTERACTIVE]
-    other       = [e for e in all_els if e.name not in _INTERACTIVE]
-    elements    = (interactive + other)[:MAX_NODES]
+    soup    = BeautifulSoup(dom_html or "<html></html>", "html.parser")
+    all_els = soup.find_all(True)
+
+    # Instruction-aware pre-pruning before graph construction.
+    if len(all_els) <= MAX_NODES:
+        elements = list(all_els)
+    else:
+        candidate_reprs = candidate_reprs or []
+        query_text = f"{task_text} {' '.join(candidate_reprs[:20])}".strip()
+        query_toks = _tokenize_text(query_text)
+
+        scored = []
+        for idx, el in enumerate(all_els):
+            tag   = el.name or ""
+            attrs = " ".join(f"{k}={v}" for k, v in (el.attrs or {}).items())
+            text  = (el.get_text(separator=" ", strip=True) or "")[:128]
+            node_toks = _tokenize_text(f"{tag} {attrs} {text}")
+
+            overlap = len(node_toks & query_toks) if query_toks else 0
+            score = float(overlap)
+            if tag in _INTERACTIVE:
+                score += 1.0
+            if "backend_node_id" in (el.attrs or {}):
+                score += 0.25
+
+            # Tie-break by earlier DOM order for deterministic behavior.
+            scored.append((score, -idx, el))
+
+        scored.sort(reverse=True)
+        elements = [el for _, _, el in scored[:MAX_NODES]]
+
+        # Restore DOM traversal order after selection so edges stay structurally natural.
+        selected_ids = {id(el) for el in elements}
+        elements = [el for el in all_els if id(el) in selected_ids]
 
     if not elements:
         return (torch.zeros(1, NODE_FEAT_DIM),
@@ -224,7 +253,7 @@ class GATLayer(nn.Module):
             self.a(torch.cat([Wx[src], Wx[dst]], dim=-1))
         ).squeeze(-1)
 
-        # Dense N×N attention matrix — avoids scatter, safe for MAX_NODES=64
+        # Dense N×N attention matrix — avoids scatter at current MAX_NODES sizes.
         # dtype follows e so bfloat16 stays consistent end-to-end
         attn = torch.full((N, N, self.heads), float("-inf"),
                           device=x.device, dtype=e.dtype)
@@ -268,17 +297,20 @@ class GATPretrainer(nn.Module):
         self.task_proj   = nn.Linear(SBERT_DIM, GRAPH_OUT_DIM)
         # Binary node-relevance head: (node_emb ⊙ task_proj) → logit
         self.node_head   = nn.Linear(GRAPH_OUT_DIM, 2)
-        # Action-type head over mean-pooled graph
-        self.action_head = nn.Linear(GRAPH_OUT_DIM, NUM_ACTIONS)
+        # Candidate-action scorer over SBERT-encoded action_reprs.
+        self.cand_proj   = nn.Linear(SBERT_DIM, GRAPH_OUT_DIM)
 
     def forward(self, node_feats: torch.Tensor,
                 edge_index: torch.Tensor,
-                task_emb: torch.Tensor):
+            task_emb: torch.Tensor,
+            cand_embs: torch.Tensor):
         node_embs     = self.gat(node_feats, edge_index)           # (N, 512)
         task_proj     = self.task_proj(task_emb)                   # (1, 512)
         node_logits   = self.node_head(node_embs * task_proj)      # (N, 2)
-        action_logits = self.action_head(node_embs.mean(0))        # (NUM_ACTIONS,)
-        return node_logits, action_logits
+        action_ctx    = node_embs.mean(0) * task_proj.squeeze(0)   # (512,)
+        cand_vecs     = self.cand_proj(cand_embs)                  # (K, 512)
+        candidate_logits = (cand_vecs @ action_ctx) / math.sqrt(float(GRAPH_OUT_DIM))
+        return node_logits, candidate_logits
 
 # =========================
 # 8. INIT
@@ -295,6 +327,8 @@ if DEVICE == "cuda":
         compile_kwargs["mode"] = "max-autotune"
     model = torch.compile(model, **compile_kwargs)
 
+save_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+
 print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 print(f"GPU_TYPE={GPU_TYPE}  MAX_NODES={MAX_NODES}  GRAD_ACCUM={GRAD_ACCUM}  LR={LEARNING_RATE}")
 
@@ -303,21 +337,32 @@ print(f"GPU_TYPE={GPU_TYPE}  MAX_NODES={MAX_NODES}  GRAD_ACCUM={GRAD_ACCUM}  LR=
 #     Runs once; subsequent epochs read from disk.
 #     Eliminates SBERT + BeautifulSoup overhead (~20 ms/sample) during training.
 # =========================
-CACHE_PATH = f"{SAVE_DIR}/dom_cache_n{MAX_NODES}.pkl"
+CACHE_PATH = f"{SAVE_DIR}/dom_cache_n{MAX_NODES}_candidx_v2.pkl"
 
 if Path(CACHE_PATH).exists():
-    cache = pickle.load(open(CACHE_PATH, "rb"))
+    with open(CACHE_PATH, "rb") as f:
+        cache = pickle.load(f)
     print(f"Loaded cache: {len(cache)} samples from {CACHE_PATH}")
 else:
     cache = {}
+    skipped_bad_target = 0
+    skipped_no_candidates = 0
+    skipped_exceptions = 0
+    max_error_logs = 10
     print("Building preprocessing cache (runs once)...")
     for i, sample in enumerate(tqdm(dataset, desc="Caching", dynamic_ncols=True)):
         html = sample.get("cleaned_html") or sample.get("raw_html") or ""
         if not html:
             continue
         try:
-            nf, ei, bids = dom_to_graph(html)
+            cand_reprs = sample.get("action_reprs") or []
+            task_text = sample.get("confirmed_task") or ""
+            nf, ei, bids = dom_to_graph(html, task_text=task_text, candidate_reprs=cand_reprs)
             te = encode_texts([sample["confirmed_task"]])  # (1, 384)
+            if not cand_reprs:
+                skipped_no_candidates += 1
+                continue
+            cand_embs = encode_texts(cand_reprs)  # (K, 384)
 
             pos_cands   = sample.get("pos_candidates") or []
             pos_bid_set = {_bid(c) for c in pos_cands if c}
@@ -325,19 +370,34 @@ else:
                 [1 if b in pos_bid_set else 0 for b in bids], dtype=torch.long
             )
 
-            op     = sample.get("operation") or {}
-            op_str = (op.get("op", "NOOP") if isinstance(op, dict) else "NOOP").upper()
-            act    = ACT2IDX.get(op_str, ACT2IDX["NOOP"])
+            target_raw = sample.get("target_action_index", 0)
+            try:
+                target_idx = int(target_raw)
+            except Exception:
+                skipped_bad_target += 1
+                continue
+            if target_idx < 0 or target_idx >= cand_embs.size(0):
+                skipped_bad_target += 1
+                continue
 
-            cache[i] = (nf, ei, node_labels, te, act)
-        except Exception:
+            cache[i] = (nf, ei, node_labels, te, cand_embs, target_idx)
+        except Exception as ex:
+            skipped_exceptions += 1
+            if skipped_exceptions <= max_error_logs:
+                print(f"[cache-skip] idx={i} reason={type(ex).__name__}: {ex}")
             continue
 
         if i % 500 == 0 and i > 0:
-            pickle.dump(cache, open(CACHE_PATH, "wb"))
+            with open(CACHE_PATH, "wb") as f:
+                pickle.dump(cache, f)
 
-    pickle.dump(cache, open(CACHE_PATH, "wb"))
+    with open(CACHE_PATH, "wb") as f:
+        pickle.dump(cache, f)
     print(f"Cache built: {len(cache)} samples → {CACHE_PATH}")
+    print(
+        f"Skipped: no_candidates={skipped_no_candidates}, "
+        f"bad_target_index={skipped_bad_target}, exceptions={skipped_exceptions}"
+    )
 
 # =========================
 # 9. TRAINING LOOP
@@ -348,6 +408,7 @@ SAVE_EVERY = 1000
 
 _AMP_DTYPE  = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 _AMP_DEVICE = "cuda"          if DEVICE == "cuda" else "cpu"
+amp_enabled = (_AMP_DEVICE == "cuda")
 
 cached_indices = sorted(cache.keys())
 step, running_loss = 0, 0.0
@@ -358,24 +419,25 @@ for epoch in range(EPOCHS):
     pbar = tqdm(cached_indices, desc=f"Epoch {epoch+1}/{EPOCHS}", dynamic_ncols=True)
 
     for i in pbar:
-        node_feats, edge_index, node_labels, task_emb, act = cache[i]
+        node_feats, edge_index, node_labels, task_emb, cand_embs, target_idx = cache[i]
         N = node_feats.size(0)
 
         node_feats  = node_feats.to(DEVICE)
         edge_index  = edge_index.to(DEVICE)
         node_labels = node_labels.to(DEVICE)
-        act_label   = torch.tensor(act, device=DEVICE)
+        cand_embs   = cand_embs.to(DEVICE)
+        target_label = torch.tensor(target_idx, dtype=torch.long, device=DEVICE)
         task_emb    = task_emb.to(DEVICE)
 
-        with torch.amp.autocast(_AMP_DEVICE, dtype=_AMP_DTYPE):
-            node_logits, action_logits = model(node_feats, edge_index, task_emb)
+        with torch.amp.autocast(_AMP_DEVICE, dtype=_AMP_DTYPE, enabled=amp_enabled):
+            node_logits, candidate_logits = model(node_feats, edge_index, task_emb, cand_embs)
 
             n_pos = max(node_labels.sum().item(), 1)
             n_neg = N - n_pos
-            cls_w = torch.tensor([1.0, n_neg / n_pos], device=DEVICE)
+            cls_w = torch.tensor([1.0, max(n_neg, 1) / n_pos], device=DEVICE)
             node_loss   = F.cross_entropy(node_logits, node_labels, weight=cls_w)
-            action_loss = F.cross_entropy(action_logits.unsqueeze(0), act_label.unsqueeze(0))
-            loss = (node_loss + 0.5 * action_loss) / GRAD_ACCUM
+            candidate_loss = F.cross_entropy(candidate_logits.unsqueeze(0), target_label.unsqueeze(0))
+            loss = (node_loss + 0.5 * candidate_loss) / GRAD_ACCUM
 
         loss.backward()
         step         += 1
@@ -393,9 +455,15 @@ for epoch in range(EPOCHS):
         if step % SAVE_EVERY == 0:
             torch.save({
                 "epoch": epoch, "step": step,
-                "model": model.state_dict(),
+                "model": save_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
             }, f"{SAVE_DIR}/ckpt_step{step}.pt")
+
+    # Flush leftover gradients when total steps is not divisible by GRAD_ACCUM.
+    if step % GRAD_ACCUM != 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad()
 
     print(f"Epoch {epoch+1} done  (step={step})")
 
@@ -403,7 +471,7 @@ for epoch in range(EPOCHS):
 # 10. SAVE GAT WEIGHTS  (load these into DOMGraphTransformer in multimodal_GNN_Cross.py)
 # =========================
 torch.save({
-    "gat": model.gat.state_dict(),
+    "gat": save_model.gat.state_dict(),
     "config": {
         "in_dim":      NODE_FEAT_DIM,
         "hidden_dim":  GRAPH_HIDDEN_DIM,
